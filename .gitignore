@@ -1,0 +1,15 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# commit-mychanges transient state (if init'd in this repo)
+.mychanges/
