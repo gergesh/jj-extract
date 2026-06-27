@@ -6,7 +6,8 @@ changes into a separate commit — `jj split` for Jujutsu, a
 `refs/mychanges/<agent>` commit for git.
 
 It is a small CLI (`mychanges`) plus a Claude Code hook that does the recording.
-Agents use the CLI; the hook is wired up once per repo by `mychanges init`.
+Agents use the CLI; the hook is registered once (globally or per-repo) with
+`mychanges install`, and each repo opts in with `mychanges init`.
 
 ## How it works
 
@@ -43,12 +44,30 @@ uv tool install /path/to/commit-mychanges      # puts `mychanges` on PATH
 uv run mychanges --help
 ```
 
-## Use
+## Set up the hooks once (global) vs per-repo
 
-In the repo where agents collaborate:
+Hook **registration** is separate from per-repo **opt-in**:
 
 ```bash
-mychanges init            # create .mychanges/ + install hooks in .claude/settings.json
+mychanges install            # register hooks once in ~/.claude/settings.json (all repos)
+mychanges install --project  # or just this repo's .claude/settings.json
+mychanges uninstall          # remove them again (leaves your other hooks intact)
+```
+
+`install` merges into your existing settings (preserving every other key and
+hook) and writes a `*.mychanges-bak` backup first. The **global** command is
+*gated*: the hook only spawns when the session's repo contains a `.mychanges/`
+dir, so it costs ~nothing in every repo you haven't opted into. (The gate checks
+`$CLAUDE_PROJECT_DIR/.mychanges`; pass `--no-gate` if you launch Claude from a
+subdirectory of the repo.)
+
+## Use
+
+Opt a repo in (creates the `.mychanges/` marker the hook gates on — no settings
+edit):
+
+```bash
+mychanges init            # opt this repo in
 mychanges init --bash     # also attribute Bash-driven file changes
 ```
 
@@ -99,7 +118,9 @@ Toggling `bash` takes effect immediately — no re-init needed.
 
 | Command | What it does |
 |---|---|
-| `mychanges init [--bash] [--command C] [--settings P]` | Create `.mychanges/`, install hooks |
+| `mychanges install [--global/--project] [--gate/--no-gate]` | Register the hooks in Claude settings (run once) |
+| `mychanges uninstall [--global/--project]` | Remove the hooks (leaves other hooks intact) |
+| `mychanges init [--bash] [--force]` | Opt this repo in: create the `.mychanges/` marker |
 | `mychanges status [--json]` | All agents, their live files, overlaps |
 | `mychanges mine [--agent A] [--json] [--paths]` | My still-live changed files |
 | `mychanges commit -m MSG [--agent A] [--dry-run] [--keep]` | Harvest my changes into a commit |

@@ -76,15 +76,14 @@ def init(
     bash: bool = typer.Option(
         False, "--bash/--no-bash", help="Also attribute files changed by Bash commands."
     ),
-    command: str | None = typer.Option(
-        None, "--command", help="Override the hook command written to settings.json."
-    ),
-    settings: Path | None = typer.Option(
-        None, "--settings", help="settings.json to patch (default: ./.claude/settings.json)."
-    ),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing config.toml."),
 ) -> None:
-    """Set up attribution in the current repo: create .mychanges/ and install hooks."""
+    """Opt this repo in: create the .mychanges/ marker the hook gates on.
+
+    Hooks are registered once, separately, with `mychanges install` (globally or
+    per-project). This command only creates the per-repo opt-in marker + config.
+    """
+    root = base_dir(Path.cwd())
     base = mychanges_dir(Path.cwd())
     base.mkdir(parents=True, exist_ok=True)
 
@@ -93,20 +92,23 @@ def init(
         cfg_path.write_text(render_config(bash=bash, ignore=load_config(base).ignore))
     Store(base / "attribution.db").close()  # create the db
 
-    cmd = command or _default_hook_command()
-    settings_path = settings or (base_dir(Path.cwd()) / ".claude" / "settings.json")
-    added = _merge_settings(settings_path, cmd)
-
     gitignore = base / ".gitignore"
     if not gitignore.exists():
         gitignore.write_text("# transient attribution state\nattribution.db*\npre/\nhook-error.log\ncommit.lock\n")
 
     typer.secho(f"Initialised {base}", fg=typer.colors.GREEN)
     typer.echo(f"  config:   {cfg_path}  (bash attribution: {'on' if bash else 'off'})")
-    typer.echo(f"  hooks:    {settings_path}  ({'updated' if added else 'already present'})")
-    typer.echo(f"  command:  {cmd}")
-    typer.echo("\nNext: restart agents in this repo so the SessionStart hook stamps their id,")
-    typer.echo("then each agent runs `mychanges mine` / `mychanges commit -m \"...\"`.")
+
+    targets = _installed_targets(root)
+    if targets:
+        typer.echo(f"  hooks:    active ({', '.join(label for label, _ in targets)})")
+        typer.echo("\nRestart agents here so the SessionStart hook stamps their id,")
+        typer.echo("then each runs `mychanges mine` / `mychanges commit -m \"...\"`.")
+    else:
+        typer.secho("  hooks:    not registered yet", fg=typer.colors.YELLOW)
+        typer.echo("\nRegister them once (every repo; inert without .mychanges/):")
+        typer.secho("    mychanges install", bold=True)
+        typer.echo("…or just this repo:     mychanges install --project")
 
 
 @app.command()
@@ -243,6 +245,57 @@ def reset(
     typer.secho("cleared.", fg=typer.colors.GREEN)
 
 
+GLOBAL_SETTINGS = Path.home() / ".claude" / "settings.json"
+
+
+@app.command()
+def install(
+    global_: bool = typer.Option(
+        True,
+        "--global/--project",
+        help="Write ~/.claude/settings.json (every repo) or ./.claude/settings.json (this repo).",
+    ),
+    gate: bool | None = typer.Option(
+        None,
+        "--gate/--no-gate",
+        help="Spawn the hook only when CLAUDE_PROJECT_DIR/.mychanges exists (default: on for --global).",
+    ),
+    settings: Path | None = typer.Option(None, "--settings", help="Explicit settings.json to patch."),
+    command: str | None = typer.Option(None, "--command", help="Override the base hook command."),
+) -> None:
+    """Register the attribution hooks in Claude's settings (run once)."""
+    if gate is None:
+        gate = global_
+    target = settings or (
+        GLOBAL_SETTINGS if global_ else base_dir(Path.cwd()) / ".claude" / "settings.json"
+    )
+    full = _hook_command(command or _default_hook_command(), gate)
+    added = _merge_settings(target, full)
+    scope = "custom" if settings else ("global" if global_ else "project")
+    verb = "Installed" if added else "Already present —"
+    typer.secho(f"{verb} hooks ({scope}) → {target}", fg=typer.colors.GREEN)
+    typer.echo(f"  command:  {full}")
+    if gate:
+        typer.echo("  gated:    fires only in repos with a .mychanges/ dir (`mychanges init` to opt in)")
+    else:
+        typer.echo("  ungated:  fires in every session; opt repos in with `mychanges init`")
+
+
+@app.command()
+def uninstall(
+    global_: bool = typer.Option(True, "--global/--project", help="Which settings file to clean."),
+    settings: Path | None = typer.Option(None, "--settings", help="Explicit settings.json to clean."),
+) -> None:
+    """Remove the attribution hooks from Claude's settings (leaves other hooks intact)."""
+    target = settings or (
+        GLOBAL_SETTINGS if global_ else base_dir(Path.cwd()) / ".claude" / "settings.json"
+    )
+    n = _remove_settings(target)
+    typer.secho(
+        f"Removed {n} hook entr{'y' if n == 1 else 'ies'} from {target}", fg=typer.colors.GREEN
+    )
+
+
 # --------------------------------------------------------------------------- #
 def _default_hook_command() -> str:
     import shutil
@@ -253,11 +306,50 @@ def _default_hook_command() -> str:
     return f'"{sys.executable}" -m commit_mychanges hook'
 
 
-def _merge_settings(settings_path: Path, command: str) -> bool:
-    """Idempotently add our SessionStart / PreToolUse / PostToolUse hooks.
+def _hook_command(base_cmd: str, gate: bool) -> str:
+    """Optionally wrap the command in a shell gate so it only spawns Python in
+    repos that opted in — keeping global registration near-zero cost elsewhere.
+    The gate assumes the marker sits at CLAUDE_PROJECT_DIR; use --no-gate if you
+    launch Claude from a subdirectory of the repo."""
+    if not gate:
+        return base_cmd
+    return f'if [ -d "${{CLAUDE_PROJECT_DIR:-$PWD}}/.mychanges" ]; then exec {base_cmd}; fi'
 
-    Returns True if anything was added.
-    """
+
+def _is_our_hook(command: str) -> bool:
+    return "hook" in command and ("commit_mychanges" in command or "mychanges" in command)
+
+
+def _settings_has_our_hook(path: Path) -> bool:
+    try:
+        data = _json.loads(path.read_text())
+    except (OSError, _json.JSONDecodeError):
+        return False
+    for groups in (data.get("hooks") or {}).values():
+        for grp in groups:
+            if any(_is_our_hook(h.get("command", "")) for h in grp.get("hooks", [])):
+                return True
+    return False
+
+
+def _installed_targets(project_root: Path) -> list[tuple[str, Path]]:
+    candidates = [
+        ("global", GLOBAL_SETTINGS),
+        ("project", project_root / ".claude" / "settings.json"),
+        ("project-local", project_root / ".claude" / "settings.local.json"),
+    ]
+    return [(label, p) for label, p in candidates if _settings_has_our_hook(p)]
+
+
+def _backup(path: Path) -> None:
+    if path.exists():
+        path.with_suffix(path.suffix + ".mychanges-bak").write_text(path.read_text())
+
+
+def _merge_settings(settings_path: Path, command: str) -> bool:
+    """Idempotently add our SessionStart / PreToolUse / PostToolUse hooks,
+    preserving every other key and any pre-existing hooks. Returns True if
+    anything was added."""
     data: dict = {}
     if settings_path.exists():
         try:
@@ -271,9 +363,10 @@ def _merge_settings(settings_path: Path, command: str) -> bool:
         nonlocal changed
         groups = hooks.setdefault(event, [])
         for grp in groups:
-            if grp.get("matcher", None) == matcher or (matcher is None and "matcher" not in grp):
+            same = grp.get("matcher", None) == matcher or (matcher is None and "matcher" not in grp)
+            if same:
                 entry = grp.setdefault("hooks", [])
-                if any(h.get("command") == command for h in entry):
+                if any(_is_our_hook(h.get("command", "")) for h in entry):
                     return
                 entry.append({"type": "command", "command": command})
                 changed = True
@@ -290,5 +383,32 @@ def _merge_settings(settings_path: Path, command: str) -> bool:
 
     if changed:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
+        _backup(settings_path)
         settings_path.write_text(_json.dumps(data, indent=2) + "\n")
     return changed
+
+
+def _remove_settings(settings_path: Path) -> int:
+    if not settings_path.exists():
+        return 0
+    try:
+        data = _json.loads(settings_path.read_text())
+    except _json.JSONDecodeError:
+        return 0
+    hooks = data.get("hooks") or {}
+    removed = 0
+    for event in list(hooks):
+        groups = hooks[event]
+        for grp in list(groups):
+            entry = grp.get("hooks", [])
+            kept = [h for h in entry if not _is_our_hook(h.get("command", ""))]
+            removed += len(entry) - len(kept)
+            grp["hooks"] = kept
+            if not kept:
+                groups.remove(grp)
+        if not groups:
+            del hooks[event]
+    if removed:
+        _backup(settings_path)
+        settings_path.write_text(_json.dumps(data, indent=2) + "\n")
+    return removed
