@@ -6,18 +6,19 @@ changes into a separate commit — `jj split` for Jujutsu, a
 `refs/mychanges/<agent>` commit for git.
 
 It is a small CLI (`mychanges`) plus a Claude Code hook that does the recording.
-Agents use the CLI; the hook is registered once (globally or per-repo) with
-`mychanges install`, and each repo opts in with `mychanges init`.
+Register the hook once with `mychanges install` and recording is **automatic in
+every git/jj repo** — no per-repo setup. Attribution is stored centrally under
+`~/.claude/mychanges/`, so nothing is written into your repos.
 
 ## How it works
 
 ```
-                 ┌─ PostToolUse(Edit/Write/MultiEdit) ─ exact file paths, always
-hook (per repo) ─┤
-                 └─ Pre/PostToolUse(Bash) ── snapshot-diff of the tree, optional
+              ┌─ PostToolUse(Edit/Write/MultiEdit) ─ exact file paths, always
+hook (global) ┤
+              └─ Pre/PostToolUse(Bash) ── snapshot-diff of the tree, optional
                           │
                           ▼
-              .mychanges/attribution.db   (agent → files, SQLite/WAL)
+     ~/.claude/mychanges/<repo>-<hash>/attribution.db   (agent → files, SQLite/WAL)
                           │
         agent runs ──────►├─ mychanges mine     list my still-live changes
                           ├─ mychanges status   all agents + overlaps
@@ -44,35 +45,27 @@ uv tool install /path/to/commit-mychanges      # puts `mychanges` on PATH
 uv run mychanges --help
 ```
 
-## Set up the hooks once (global) vs per-repo
-
-Hook **registration** is separate from per-repo **opt-in**:
+## Set up once
 
 ```bash
-mychanges install            # register hooks once in ~/.claude/settings.json (all repos)
+mychanges install            # register hooks in ~/.claude/settings.json (every repo)
 mychanges install --project  # or just this repo's .claude/settings.json
 mychanges uninstall          # remove them again (leaves your other hooks intact)
 ```
 
 `install` merges into your existing settings (preserving every other key and
-hook) and writes a `*.mychanges-bak` backup first. The **global** command is
-*gated*: the hook only spawns when the session's repo contains a `.mychanges/`
-dir, so it costs ~nothing in every repo you haven't opted into. (The gate checks
-`$CLAUDE_PROJECT_DIR/.mychanges`; pass `--no-gate` if you launch Claude from a
-subdirectory of the repo.)
+hook) and writes a `*.mychanges-bak` backup first. After this, recording is
+automatic in every git/jj repo — the hook is inert outside a repo and writes
+data centrally, never into the working tree.
+
+`mychanges init` is **optional** now: use it only to turn on Bash attribution
+for a repo (`mychanges init --bash`) or pre-create its store. To enable Bash
+attribution everywhere, put `[attribution]\nbash = true` in
+`~/.claude/mychanges/config.toml`.
 
 ## Use
 
-Opt a repo in (creates the `.mychanges/` marker the hook gates on — no settings
-edit):
-
-```bash
-mychanges init            # opt this repo in
-mychanges init --bash     # also attribute Bash-driven file changes
-```
-
-Restart the agents so the `SessionStart` hook stamps their identity. Then, from
-inside any agent:
+Just edit, in any repo. Then, from inside any agent:
 
 ```bash
 mychanges mine                       # files I changed that are still live
@@ -104,7 +97,10 @@ sequential so its before/after window is clean, but concurrent agents' windows
 overlap, so a file changed by a Bash command may be attributed to whichever
 agent's window saw it.
 
-## Config (`.mychanges/config.toml`)
+## Config
+
+A repo's config lives at `~/.claude/mychanges/<repo>-<hash>/config.toml`, with a
+global fallback at `~/.claude/mychanges/config.toml`:
 
 ```toml
 [attribution]
@@ -112,20 +108,23 @@ bash = false          # attribute Bash-changed files via snapshot-diff
 ignore = [ "**/node_modules/**", "**/.venv/**", ... ]   # skipped during Bash scans
 ```
 
-Toggling `bash` takes effect immediately — no re-init needed.
+Toggling `bash` takes effect immediately. Set `MYCHANGES_HOME` to relocate the
+central store.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `mychanges install [--global/--project] [--gate/--no-gate]` | Register the hooks in Claude settings (run once) |
+| `mychanges install [--global/--project]` | Register the hooks in Claude settings (run once) |
 | `mychanges uninstall [--global/--project]` | Remove the hooks (leaves other hooks intact) |
-| `mychanges init [--bash] [--force]` | Opt this repo in: create the `.mychanges/` marker |
+| `mychanges init [--bash] [--force]` | Optional: enable Bash attribution for this repo / pre-create its store |
 | `mychanges status [--json]` | All agents, their live files, overlaps |
 | `mychanges mine [--agent A] [--json] [--paths]` | My still-live changed files |
 | `mychanges commit -m MSG [--agent A] [--dry-run] [--keep]` | Harvest my changes into a commit |
 | `mychanges reset [--agent A] [--all]` | Forget attribution records (never touches files/commits) |
+| `mychanges where` | Print the central data dir for the current repo |
+| `mychanges list` | List all repos with recorded attribution |
 | `mychanges hook` | Hook entry point (used in settings.json; not for manual use) |
 
-`.mychanges/` holds only transient state (the SQLite log, pre-snapshots); a
-`.gitignore` is written there automatically.
+Attribution data lives entirely under `~/.claude/mychanges/` — nothing is
+written into your repositories.

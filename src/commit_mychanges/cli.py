@@ -10,7 +10,7 @@ import typer
 from . import vcs as vcsmod
 from .config import load_config, render_config
 from .identity import ENV_VAR, from_cli
-from .paths import base_dir, mychanges_dir
+from .paths import base_dir, central_root, ensure_data_dir, resolve_data_dir
 from .store import Store
 
 app = typer.Typer(
@@ -29,17 +29,25 @@ def _resolve_agent(explicit: str | None) -> str:
     if not agent:
         _err(
             f"Could not determine which agent you are. Pass --agent <id> or set ${ENV_VAR}.\n"
-            "(`mychanges init` installs a SessionStart hook that sets this automatically.)"
+            "(The SessionStart hook sets this automatically once `mychanges install` has run.)"
         )
         raise typer.Exit(2)
     return agent
 
 
-def _open_store(base: Path) -> Store:
-    if not base.is_dir():
-        _err(f"Not initialised: {base} does not exist. Run `mychanges init` here first.")
+def _repo_data_or_exit() -> tuple[Path, Path]:
+    """Resolve (repo_root, central data dir) for the cwd, or exit."""
+    root, base = resolve_data_dir(Path.cwd())
+    if root is None or base is None:
+        _err("Not inside a git or jj repo.")
         raise typer.Exit(2)
-    return Store(base / "attribution.db")
+    return root, base
+
+
+def _store_if_any(base: Path) -> Store | None:
+    """Open the repo's store, or None if nothing has been recorded yet."""
+    db = base / "attribution.db"
+    return Store(db) if db.exists() else None
 
 
 def _mine_paths(store: Store, agent: str, vcs: vcsmod.Vcs | None) -> tuple[list[str], dict[str, set[str]]]:
@@ -74,41 +82,31 @@ def _commit_lock(base: Path):
 @app.command()
 def init(
     bash: bool = typer.Option(
-        False, "--bash/--no-bash", help="Also attribute files changed by Bash commands."
+        False, "--bash/--no-bash", help="Attribute files changed by Bash commands (this repo)."
     ),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing config.toml."),
 ) -> None:
-    """Opt this repo in: create the .mychanges/ marker the hook gates on.
+    """Optional: enable Bash attribution for this repo / pre-create its store.
 
-    Hooks are registered once, separately, with `mychanges install` (globally or
-    per-project). This command only creates the per-repo opt-in marker + config.
+    Recording is automatic in every git/jj repo once `mychanges install` has run,
+    so you normally don't need this. Use it to turn on Bash attribution here
+    (`--bash`) or to write the per-repo config.
     """
-    root = base_dir(Path.cwd())
-    base = mychanges_dir(Path.cwd())
-    base.mkdir(parents=True, exist_ok=True)
+    root, base = _repo_data_or_exit()
+    ensure_data_dir(root)
 
     cfg_path = base / "config.toml"
     if force or not cfg_path.exists():
         cfg_path.write_text(render_config(bash=bash, ignore=load_config(base).ignore))
     Store(base / "attribution.db").close()  # create the db
 
-    gitignore = base / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_text("# transient attribution state\nattribution.db*\npre/\nhook-error.log\ncommit.lock\n")
-
-    typer.secho(f"Initialised {base}", fg=typer.colors.GREEN)
-    typer.echo(f"  config:   {cfg_path}  (bash attribution: {'on' if bash else 'off'})")
-
+    typer.secho(f"Repo: {root}", fg=typer.colors.GREEN)
+    typer.echo(f"  store:  {base}  (bash attribution: {'on' if bash else 'off'})")
     targets = _installed_targets(root)
     if targets:
-        typer.echo(f"  hooks:    active ({', '.join(label for label, _ in targets)})")
-        typer.echo("\nRestart agents here so the SessionStart hook stamps their id,")
-        typer.echo("then each runs `mychanges mine` / `mychanges commit -m \"...\"`.")
+        typer.echo(f"  hooks:  active ({', '.join(label for label, _ in targets)})")
     else:
-        typer.secho("  hooks:    not registered yet", fg=typer.colors.YELLOW)
-        typer.echo("\nRegister them once (every repo; inert without .mychanges/):")
-        typer.secho("    mychanges install", bold=True)
-        typer.echo("…or just this repo:     mychanges install --project")
+        typer.secho("  hooks:  not registered — run `mychanges install`", fg=typer.colors.YELLOW)
 
 
 @app.command()
@@ -116,15 +114,21 @@ def status(
     json: bool = typer.Option(False, "--json", help="Machine-readable output."),
 ) -> None:
     """Show every agent, the files it changed, and any cross-agent overlaps."""
-    base = mychanges_dir(Path.cwd())
+    _, base = _repo_data_or_exit()
     vcs = vcsmod.detect(Path.cwd())
-    with _open_store(base) as store:
+    store = _store_if_any(base)
+    if store is None:
+        typer.echo("No attributed changes yet." if not json else _json.dumps({"agents": {}, "overlaps": {}}))
+        return
+    try:
         agents = store.agents()
         overlaps = store.path_agents()
         per_agent = {}
         for a in agents:
             paths, _ = _mine_paths(store, a, vcs)
             per_agent[a] = paths
+    finally:
+        store.close()
     shared = {p: sorted(ags) for p, ags in overlaps.items() if len(ags) > 1}
 
     if json:
@@ -155,10 +159,16 @@ def mine(
 ) -> None:
     """List the files attributed to me that are still changed in the working copy."""
     who = _resolve_agent(agent)
-    base = mychanges_dir(Path.cwd())
+    _, base = _repo_data_or_exit()
     vcs = vcsmod.detect(Path.cwd())
-    with _open_store(base) as store:
-        mine_paths, overlaps = _mine_paths(store, who, vcs)
+    store = _store_if_any(base)
+    if store is None:
+        mine_paths, overlaps = [], {}
+    else:
+        try:
+            mine_paths, overlaps = _mine_paths(store, who, vcs)
+        finally:
+            store.close()
 
     if paths_only:
         typer.echo("\n".join(mine_paths))
@@ -183,14 +193,20 @@ def commit(
 ) -> None:
     """Harvest my changes into a separate commit (jj split / git refs/mychanges/<agent>)."""
     who = _resolve_agent(agent)
-    base = mychanges_dir(Path.cwd())
+    _, base = _repo_data_or_exit()
     vcs = vcsmod.detect(Path.cwd())
     if vcs is None:
         _err("No jj or git repo found here.")
         raise typer.Exit(2)
 
-    with _open_store(base) as store:
+    store = _store_if_any(base)
+    if store is None:
+        typer.echo(f"Nothing to commit for agent {who}.")
+        return
+    try:
         mine_paths, overlaps = _mine_paths(store, who, vcs)
+    finally:
+        store.close()
     if not mine_paths:
         typer.echo(f"Nothing to commit for agent {who}.")
         return
@@ -208,7 +224,7 @@ def commit(
 
     with _commit_lock(base):
         # Re-evaluate under the lock: another agent may have committed since.
-        with _open_store(base) as store:
+        with Store(base / "attribution.db") as store:
             mine_paths, _ = _mine_paths(store, who, vcs)
         if not mine_paths:
             typer.echo(f"Nothing to commit for agent {who}.")
@@ -226,7 +242,7 @@ def commit(
         typer.echo(f"  inspect: git show {result['commit'][:12]}")
 
     if not keep:
-        with _open_store(base) as store:
+        with Store(base / "attribution.db") as store:
             store.delete_paths(who, mine_paths)
 
 
@@ -236,13 +252,43 @@ def reset(
     all: bool = typer.Option(False, "--all", help="Clear all attribution records."),
 ) -> None:
     """Forget attribution records (does not touch your files or commits)."""
-    base = mychanges_dir(Path.cwd())
+    _, base = _repo_data_or_exit()
     if not agent and not all:
         _err("Specify --agent <id> or --all.")
         raise typer.Exit(2)
-    with _open_store(base) as store:
+    store = _store_if_any(base)
+    if store is None:
+        typer.echo("Nothing to clear.")
+        return
+    with store:
         store.clear(None if all else agent)
     typer.secho("cleared.", fg=typer.colors.GREEN)
+
+
+@app.command()
+def where() -> None:
+    """Print the central data dir backing the current repo."""
+    _, base = _repo_data_or_exit()
+    typer.echo(str(base))
+
+
+@app.command("list")
+def list_repos() -> None:
+    """List repos that have recorded attribution (across all your repos)."""
+    croot = central_root()
+    rows: list[tuple[str, list[str]]] = []
+    if croot.is_dir():
+        for d in sorted(croot.iterdir()):
+            if not (d / "attribution.db").exists():
+                continue
+            repo = (d / "repo").read_text().strip() if (d / "repo").exists() else str(d)
+            with Store(d / "attribution.db") as store:
+                rows.append((repo, store.agents()))
+    if not rows:
+        typer.echo("No attribution recorded yet.")
+        return
+    for repo, agents in rows:
+        typer.echo(f"{repo}  [{', '.join(agents) or 'no agents'}]")
 
 
 GLOBAL_SETTINGS = Path.home() / ".claude" / "settings.json"
@@ -255,30 +301,24 @@ def install(
         "--global/--project",
         help="Write ~/.claude/settings.json (every repo) or ./.claude/settings.json (this repo).",
     ),
-    gate: bool | None = typer.Option(
-        None,
-        "--gate/--no-gate",
-        help="Spawn the hook only when CLAUDE_PROJECT_DIR/.mychanges exists (default: on for --global).",
-    ),
     settings: Path | None = typer.Option(None, "--settings", help="Explicit settings.json to patch."),
-    command: str | None = typer.Option(None, "--command", help="Override the base hook command."),
+    command: str | None = typer.Option(None, "--command", help="Override the hook command."),
 ) -> None:
-    """Register the attribution hooks in Claude's settings (run once)."""
-    if gate is None:
-        gate = global_
+    """Register the attribution hooks in Claude's settings (run once).
+
+    Once installed, recording is automatic in every git/jj repo — no per-repo
+    setup. Data lives centrally under ~/.claude/mychanges/, not in your repos.
+    """
     target = settings or (
         GLOBAL_SETTINGS if global_ else base_dir(Path.cwd()) / ".claude" / "settings.json"
     )
-    full = _hook_command(command or _default_hook_command(), gate)
+    full = command or _default_hook_command()
     added = _merge_settings(target, full)
     scope = "custom" if settings else ("global" if global_ else "project")
     verb = "Installed" if added else "Already present —"
     typer.secho(f"{verb} hooks ({scope}) → {target}", fg=typer.colors.GREEN)
     typer.echo(f"  command:  {full}")
-    if gate:
-        typer.echo("  gated:    fires only in repos with a .mychanges/ dir (`mychanges init` to opt in)")
-    else:
-        typer.echo("  ungated:  fires in every session; opt repos in with `mychanges init`")
+    typer.echo("  records:  automatically in every git/jj repo (data in ~/.claude/mychanges/)")
 
 
 @app.command()
@@ -304,16 +344,6 @@ def _default_hook_command() -> str:
     if exe:
         return f'"{exe}" hook'
     return f'"{sys.executable}" -m commit_mychanges hook'
-
-
-def _hook_command(base_cmd: str, gate: bool) -> str:
-    """Optionally wrap the command in a shell gate so it only spawns Python in
-    repos that opted in — keeping global registration near-zero cost elsewhere.
-    The gate assumes the marker sits at CLAUDE_PROJECT_DIR; use --no-gate if you
-    launch Claude from a subdirectory of the repo."""
-    if not gate:
-        return base_cmd
-    return f'if [ -d "${{CLAUDE_PROJECT_DIR:-$PWD}}/.mychanges" ]; then exec {base_cmd}; fi'
 
 
 def _is_our_hook(command: str) -> bool:

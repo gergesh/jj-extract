@@ -14,7 +14,7 @@ import traceback
 from pathlib import Path
 
 from .identity import ENV_VAR
-from .paths import MYCHANGES_DIRNAME, find_repo_root
+from .paths import central_root, data_dir_for_root, ensure_data_dir, find_repo_root
 
 _FILE_TOOLS = ("Edit", "Write", "MultiEdit")
 
@@ -35,21 +35,20 @@ def run_hook(_argv: list[str]) -> int:
 def _dispatch(payload: dict) -> None:
     event = payload.get("hook_event_name")
     cwd = Path(payload.get("cwd") or os.getcwd())
-    root = find_repo_root(cwd) or cwd
-    base = root / MYCHANGES_DIRNAME
 
     if event == "SessionStart":
-        _session_start(payload, base)
+        _session_start(payload)
         return
 
-    # Only act in repos the user has opted in via `mychanges init`.
-    if not base.is_dir():
+    # Record automatically in any git/jj repo; nothing to attribute outside one.
+    root = find_repo_root(cwd)
+    if root is None:
         return
 
     from .config import load_config
     from .identity import from_payload
 
-    cfg = load_config(base)
+    cfg = load_config(data_dir_for_root(root))
     agent = from_payload(payload)
     session_id = payload.get("session_id")
     tool = payload.get("tool_name")
@@ -57,23 +56,23 @@ def _dispatch(payload: dict) -> None:
     if event == "PreToolUse" and tool == "Bash" and cfg.bash:
         from .scan import snapshot_pre
 
-        snapshot_pre(base, root, agent, cfg)
+        snapshot_pre(ensure_data_dir(root), root, agent, cfg)
         return
 
     if event == "PostToolUse":
         if tool in _FILE_TOOLS:
-            _record_file_edits(payload, base, root, agent, session_id, tool)
+            _record_file_edits(payload, ensure_data_dir(root), root, agent, session_id, tool)
         elif tool == "Bash" and cfg.bash:
             from .scan import diff_post
 
-            diff_post(base, root, agent, session_id, cfg)
+            diff_post(ensure_data_dir(root), root, agent, session_id, cfg)
 
 
-def _session_start(payload: dict, base: Path) -> None:
+def _session_start(payload: dict) -> None:
     """Stamp ``MYCHANGES_AGENT=<session_id>`` into ``$CLAUDE_ENV_FILE`` so the
     agent's later CLI invocations know their own identity. Respect an
     already-set value (a deliberately named agent)."""
-    if not base.is_dir() or os.environ.get(ENV_VAR):
+    if os.environ.get(ENV_VAR):
         return
     env_file = os.environ.get("CLAUDE_ENV_FILE")
     sid = payload.get("session_id")
@@ -114,12 +113,11 @@ def _record_file_edits(
             store.record(agent, session_id, tool, "PostToolUse", rel, change)
 
 
-def _log_error(payload: dict, message: str) -> None:
+def _log_error(_payload: dict, message: str) -> None:
     try:
-        cwd = Path(payload.get("cwd") or os.getcwd())
-        base = (find_repo_root(cwd) or cwd) / MYCHANGES_DIRNAME
-        if base.is_dir():
-            with open(base / "hook-error.log", "a") as f:
-                f.write(message + "\n")
+        croot = central_root()
+        croot.mkdir(parents=True, exist_ok=True)
+        with open(croot / "hook-error.log", "a") as f:
+            f.write(message + "\n")
     except Exception:
         pass

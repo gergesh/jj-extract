@@ -4,6 +4,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .paths import central_root
+
 # File-level ignore globs for Bash snapshot-diff (matched against the relative
 # POSIX path and the basename). Heavy/irrelevant directories are also pruned by
 # name in scan.py for speed.
@@ -30,18 +32,22 @@ class Config:
     ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
 
 
-def load_config(mychanges_dir: Path) -> Config:
-    path = mychanges_dir / "config.toml"
-    if not path.exists():
-        return Config()
-    try:
-        data = tomllib.loads(path.read_text())
-    except (OSError, tomllib.TOMLDecodeError):
-        return Config()
-    attr = data.get("attribution", {}) or {}
-    ignore = attr.get("ignore")
-    ignore_list = [str(x) for x in ignore] if isinstance(ignore, list) else list(DEFAULT_IGNORE)
-    return Config(bash=bool(attr.get("bash", False)), ignore=ignore_list)
+def load_config(base: Path) -> Config:
+    """Load config for a repo's data dir, falling back to a global config at
+    ``~/.claude/mychanges/config.toml`` (so Bash attribution can be enabled
+    everywhere at once), then to defaults."""
+    for path in (base / "config.toml", central_root() / "config.toml"):
+        if not path.exists():
+            continue
+        try:
+            data = tomllib.loads(path.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        attr = data.get("attribution", {}) or {}
+        ignore = attr.get("ignore")
+        ignore_list = [str(x) for x in ignore] if isinstance(ignore, list) else list(DEFAULT_IGNORE)
+        return Config(bash=bool(attr.get("bash", False)), ignore=ignore_list)
+    return Config()
 
 
 CONFIG_TEMPLATE = """\
