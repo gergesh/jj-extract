@@ -21,7 +21,7 @@ hook (global) ┤
      ~/.claude/mychanges/<repo>-<hash>/attribution.db   (agent → files, SQLite/WAL)
                           │
         agent runs ──────►├─ mychanges mine     list my still-live changes
-                          ├─ mychanges status   all agents + overlaps
+                          ├─ mychanges list     numbered agents + overlaps
                           └─ mychanges commit    jj split / git per-agent commit
 ```
 
@@ -65,14 +65,20 @@ attribution everywhere, put `[attribution]\nbash = true` in
 
 ## Use
 
-Just edit, in any repo. Then, from inside any agent:
+Just edit, in any repo. To inspect or harvest changes — including when *you* run
+the tool and don't know the agent ids:
 
 ```bash
-mychanges mine                       # files I changed that are still live
-mychanges status                     # every agent + cross-agent overlaps
-mychanges commit -m "add parser"     # harvest my changes into their own commit
+mychanges list                       # numbered agents + their changes (+ overlaps)
+mychanges mine                       # files I (this session) changed, still live
+mychanges commit --agent 1 -m "..."  # harvest agent [1] from `list` (or a name prefix)
+mychanges commit -m "add parser"     # harvest my own changes
 mychanges commit -m "..." --dry-run  # show the exact jj/git commands first
 ```
+
+`list` numbers every agent so you never need the raw id — pass the number (or a
+unique name prefix) to `--agent` on `mine`/`commit`. `mychanges list --repos`
+shows all repos that have recordings.
 
 - **jj:** `commit` runs `jj file track <my paths>` (needed when
   `snapshot.auto-track` is off) then `jj split -m <msg> <my paths>`, peeling your
@@ -88,7 +94,7 @@ mychanges commit -m "..." --dry-run  # show the exact jj/git commands first
 
 If two agents edit **overlapping regions of the same file**, the file on disk
 holds only the final bytes — there is no way to split that into two independent
-commits. This tool works at **file granularity**: `status`/`mine` flag any file
+commits. This tool works at **file granularity**: `list`/`mine` flag any file
 touched by more than one agent, and `commit` takes the current on-disk content
 (last writer wins) for shared files. Partition work across agents to avoid this.
 
@@ -118,12 +124,11 @@ central store.
 | `mychanges install [--global/--project]` | Register the hooks in Claude settings (run once) |
 | `mychanges uninstall [--global/--project]` | Remove the hooks (leaves other hooks intact) |
 | `mychanges init [--bash] [--force]` | Optional: enable Bash attribution for this repo / pre-create its store |
-| `mychanges status [--json]` | All agents, their live files, overlaps |
+| `mychanges list [--repos] [--json]` | Numbered agents + their changes (or, with `--repos`, all repos) |
 | `mychanges mine [--agent A] [--json] [--paths]` | My still-live changed files |
-| `mychanges commit -m MSG [--agent A] [--dry-run] [--keep]` | Harvest my changes into a commit |
+| `mychanges commit -m MSG [--agent A] [--dry-run] [--keep]` | Harvest an agent's changes into a commit (`A` = id, index, or prefix) |
 | `mychanges reset [--agent A] [--all]` | Forget attribution records (never touches files/commits) |
 | `mychanges where` | Print the central data dir for the current repo |
-| `mychanges list` | List all repos with recorded attribution |
 | `mychanges hook` | Hook entry point (used in settings.json; not for manual use) |
 
 Attribution data lives entirely under `~/.claude/mychanges/` — nothing is

@@ -55,6 +55,16 @@ class Store:
     def agents(self) -> list[str]:
         return [r[0] for r in self.conn.execute("SELECT DISTINCT agent FROM events ORDER BY agent")]
 
+    def agent_summaries(self) -> list[dict]:
+        """Per-agent rollup: distinct paths touched, event count, first/last ts."""
+        return [
+            {"agent": a, "paths": npaths, "events": nevents, "first_ts": mn, "last_ts": mx}
+            for a, npaths, nevents, mn, mx in self.conn.execute(
+                "SELECT agent, COUNT(DISTINCT path), COUNT(*), MIN(ts), MAX(ts) "
+                "FROM events GROUP BY agent"
+            )
+        ]
+
     def paths_for(self, agent: str) -> list[str]:
         return [
             r[0]

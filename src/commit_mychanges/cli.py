@@ -50,6 +50,58 @@ def _store_if_any(base: Path) -> Store | None:
     return Store(db) if db.exists() else None
 
 
+def _recency_order(summaries: list[dict]) -> list[str]:
+    """Agent ids most-recently-active first — the order shown by `list`, so the
+    numbered handles stay consistent with `--agent <n>`."""
+    return [s["agent"] for s in sorted(summaries, key=lambda s: (-(s["last_ts"] or 0.0), s["agent"]))]
+
+
+def _ago(ts: float | None) -> str:
+    import time
+
+    if not ts:
+        return "?"
+    delta = max(0.0, time.time() - ts)
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if delta >= size:
+            return f"{int(delta // size)}{unit} ago"
+    return f"{int(delta)}s ago"
+
+
+def _agent_menu(order: list[str]) -> str:
+    return "\n".join(f"  [{i + 1}] {a}" for i, a in enumerate(order)) or "  (none)"
+
+
+def _resolve_agent_ref(base: Path, ref: str) -> str:
+    """Resolve a user-supplied --agent value to a full id: exact match, else a
+    1-based index from `list`, else a unique name prefix/substring."""
+    store = _store_if_any(base)
+    summaries = store.agent_summaries() if store else []
+    if store:
+        store.close()
+    order = _recency_order(summaries)
+    if ref in order:
+        return ref
+    if ref.isdigit() and 1 <= int(ref) <= len(order):
+        return order[int(ref) - 1]
+    matches = [a for a in order if a.startswith(ref)] or [a for a in order if ref in a]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        _err(f"No agent matches {ref!r}. Known agents:\n{_agent_menu(order)}")
+    else:
+        _err(f"{ref!r} is ambiguous (matches: {', '.join(matches)}). Use the index or a longer prefix.")
+    raise typer.Exit(2)
+
+
+def _resolve_agent_query(base: Path, explicit: str | None) -> str:
+    """For mine/commit: resolve --agent (id/index/prefix) if given, else fall
+    back to the caller's own identity from the environment."""
+    if explicit:
+        return _resolve_agent_ref(base, explicit)
+    return _resolve_agent(None)
+
+
 def _mine_paths(store: Store, agent: str, vcs: vcsmod.Vcs | None) -> tuple[list[str], dict[str, set[str]]]:
     """Paths attributed to ``agent`` that are still live in the working copy,
     plus the full path->agents overlap map."""
@@ -110,56 +162,14 @@ def init(
 
 
 @app.command()
-def status(
-    json: bool = typer.Option(False, "--json", help="Machine-readable output."),
-) -> None:
-    """Show every agent, the files it changed, and any cross-agent overlaps."""
-    _, base = _repo_data_or_exit()
-    vcs = vcsmod.detect(Path.cwd())
-    store = _store_if_any(base)
-    if store is None:
-        typer.echo("No attributed changes yet." if not json else _json.dumps({"agents": {}, "overlaps": {}}))
-        return
-    try:
-        agents = store.agents()
-        overlaps = store.path_agents()
-        per_agent = {}
-        for a in agents:
-            paths, _ = _mine_paths(store, a, vcs)
-            per_agent[a] = paths
-    finally:
-        store.close()
-    shared = {p: sorted(ags) for p, ags in overlaps.items() if len(ags) > 1}
-
-    if json:
-        typer.echo(_json.dumps({"vcs": vcs.kind if vcs else None, "agents": per_agent, "overlaps": shared}, indent=2))
-        return
-
-    if not agents:
-        typer.echo("No attributed changes yet.")
-        return
-    typer.echo(f"VCS: {vcs.kind if vcs else 'none'}\n")
-    for a, paths in per_agent.items():
-        typer.secho(f"{a}", fg=typer.colors.CYAN, bold=True)
-        if not paths:
-            typer.echo("  (no live changes)")
-        for p in paths:
-            mark = "  ⚠ also: " + ", ".join(x for x in shared.get(p, []) if x != a) if p in shared else ""
-            typer.echo(f"  {p}{mark}")
-        typer.echo("")
-    if shared:
-        typer.secho(f"{len(shared)} file(s) touched by multiple agents — last writer's content wins on commit.", fg=typer.colors.YELLOW)
-
-
-@app.command()
 def mine(
-    agent: str | None = typer.Option(None, "--agent", help=f"Agent id (default: ${ENV_VAR})."),
+    agent: str | None = typer.Option(None, "--agent", help=f"Agent id, index from 'list', or unique prefix (default: ${ENV_VAR})."),
     json: bool = typer.Option(False, "--json", help="Machine-readable output."),
     paths_only: bool = typer.Option(False, "--paths", help="Print just the paths, one per line."),
 ) -> None:
     """List the files attributed to me that are still changed in the working copy."""
-    who = _resolve_agent(agent)
     _, base = _repo_data_or_exit()
+    who = _resolve_agent_query(base, agent)
     vcs = vcsmod.detect(Path.cwd())
     store = _store_if_any(base)
     if store is None:
@@ -187,13 +197,13 @@ def mine(
 @app.command()
 def commit(
     message: str = typer.Option(..., "-m", "--message", help="Commit / change description."),
-    agent: str | None = typer.Option(None, "--agent", help=f"Agent id (default: ${ENV_VAR})."),
+    agent: str | None = typer.Option(None, "--agent", help=f"Agent id, index from 'list', or unique prefix (default: ${ENV_VAR})."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the commands instead of running."),
     keep: bool = typer.Option(False, "--keep", help="Keep attribution records after committing."),
 ) -> None:
     """Harvest my changes into a separate commit (jj split / git refs/mychanges/<agent>)."""
-    who = _resolve_agent(agent)
     _, base = _repo_data_or_exit()
+    who = _resolve_agent_query(base, agent)
     vcs = vcsmod.detect(Path.cwd())
     if vcs is None:
         _err("No jj or git repo found here.")
@@ -273,8 +283,73 @@ def where() -> None:
 
 
 @app.command("list")
-def list_repos() -> None:
-    """List repos that have recorded attribution (across all your repos)."""
+def list_cmd(
+    repos: bool = typer.Option(False, "--repos", help="List all repos with recordings instead of this repo's agents."),
+    json: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """List agents and their changes in this repo.
+
+    Each agent gets a number — pass it as --agent to mine/commit, so you never
+    need to know the raw agent id.
+    """
+    if repos:
+        _list_repos(json)
+        return
+
+    _, base = _repo_data_or_exit()
+    vcs = vcsmod.detect(Path.cwd())
+    store = _store_if_any(base)
+    if store is None:
+        typer.echo(_json.dumps({"agents": []}) if json else "No attributed changes yet.")
+        return
+    try:
+        summaries = store.agent_summaries()
+        overlaps = store.path_agents()
+        order = _recency_order(summaries)
+        smap = {s["agent"]: s for s in summaries}
+        live = {a: _mine_paths(store, a, vcs)[0] for a in order}
+    finally:
+        store.close()
+    shared = {p: sorted(ags) for p, ags in overlaps.items() if len(ags) > 1}
+
+    if json:
+        typer.echo(_json.dumps({
+            "vcs": vcs.kind if vcs else None,
+            "agents": [
+                {
+                    "index": i + 1,
+                    "id": a,
+                    "live_files": live[a],
+                    "recorded_paths": smap[a]["paths"],
+                    "last_active": smap[a]["last_ts"],
+                }
+                for i, a in enumerate(order)
+            ],
+            "overlaps": shared,
+        }, indent=2))
+        return
+
+    if not order:
+        typer.echo("No attributed changes yet.")
+        return
+    typer.echo(f"VCS: {vcs.kind if vcs else 'none'}\n")
+    for i, a in enumerate(order):
+        typer.secho(f"[{i + 1}] {a}", fg=typer.colors.CYAN, bold=True)
+        typer.echo(f"    {len(live[a])} live file(s) · last active {_ago(smap[a]['last_ts'])}")
+        for p in live[a]:
+            others = [x for x in shared.get(p, []) if x != a]
+            mark = "  ⚠ also: " + ", ".join(others) if others else ""
+            typer.echo(f"      {p}{mark}")
+        typer.echo("")
+    typer.echo("Use the [number] (or a name prefix) as --agent, e.g. `mychanges commit --agent 1 -m \"...\"`.")
+    if shared:
+        typer.secho(
+            f"{len(shared)} file(s) touched by >1 agent — last writer's content wins on commit.",
+            fg=typer.colors.YELLOW,
+        )
+
+
+def _list_repos(json: bool) -> None:
     croot = central_root()
     rows: list[tuple[str, list[str]]] = []
     if croot.is_dir():
@@ -284,6 +359,9 @@ def list_repos() -> None:
             repo = (d / "repo").read_text().strip() if (d / "repo").exists() else str(d)
             with Store(d / "attribution.db") as store:
                 rows.append((repo, store.agents()))
+    if json:
+        typer.echo(_json.dumps([{"repo": r, "agents": a} for r, a in rows], indent=2))
+        return
     if not rows:
         typer.echo("No attribution recorded yet.")
         return
