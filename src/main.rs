@@ -30,7 +30,6 @@ use std::process::exit;
 
 use identity::{from_cli, ENV_VAR};
 use jj::Jj;
-use lock::RepoLock;
 use paths::{data_dir_for_root, find_repo_root};
 use state::State;
 
@@ -101,8 +100,9 @@ fn cmd_collect(message: Option<String>, to: Option<String>, agent_opt: Option<St
     };
 
     let jj = Jj::new(&root);
-    // Serialize against concurrent hooks/collects — both mutate the stack.
-    let _guard = RepoLock::acquire(&base_dir).ok();
+    // Serialize against concurrent hooks/collects via the same edit lock — all
+    // mutate the shared stack. Released when `_guard` drops.
+    let _guard = lock::Guard::new(&base_dir, &agent);
     let mut state = State::load(&base_dir);
 
     let change = match &to {

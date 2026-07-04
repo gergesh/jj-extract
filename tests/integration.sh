@@ -68,30 +68,19 @@ ok "a1 does not own +TOP"            "nothas '$(chg a1)' TOP"
 ok "a2 owns +TOP (despite the shift)" "has '$(chg a2)' TOP"
 ok "a2 does not own +BOTTOM"         "nothas '$(chg a2)' BOTTOM"
 
-echo "== B: race — two agents' brackets interleave on different files =="
+echo "== B: TRUE parallel edits (the cross-tool edit lock must serialize them) =="
 new_repo b
 printf 'a\nb\n' >f1.txt; printf 'x\ny\n' >f2.txt
 jj file track f1.txt f2.txt >/dev/null 2>&1; jj describe -m two >/dev/null 2>&1; jj new >/dev/null 2>&1
 collect a1; collect a2
-# Realistic interleave: each agent's Pre precedes its own edit; a1's Post sees
-# a2's file already dirty in @ and must claim only its own.
-hookev PreToolUse a1 f1.txt
-printf 'a\nA1-add\nb\n' >f1.txt
-hookev PreToolUse a2 f2.txt
-printf 'x\nA2-add\ny\n' >f2.txt
-hookev PostToolUse a1 f1.txt          # @ has both f1 and f2 dirty; claims only f1
-hookev PostToolUse a2 f2.txt
-ok "a1 claims only f1" "has '$(chg a1)' A1-add && nothas '$(chg a1)' A2-add"
-ok "a2 claims only f2" "has '$(chg a2)' A2-add && nothas '$(chg a2)' A1-add"
-
-echo "== B2: TRUE parallel Post hooks (the flock must serialize them) =="
-hookev PreToolUse a1 f1.txt; hookev PreToolUse a2 f2.txt
-printf 'a\nA1-add\nb\nP1\n' >f1.txt; printf 'x\nA2-add\ny\nP2\n' >f2.txt
-hookev PostToolUse a1 f1.txt &
-hookev PostToolUse a2 f2.txt &
+# Two full Pre→write→Post brackets launched at once. The edit lock (Pre takes
+# it, Post releases it) forces one bracket to finish before the other's Pre
+# proceeds, so the stack is never mutated concurrently.
+edit a1 f1.txt $'a\nA1-add\nb\n' &
+edit a2 f2.txt $'x\nA2-add\ny\n' &
 wait
-ok "parallel: a1 got P1, not P2" "has '$(chg a1)' P1 && nothas '$(chg a1)' P2"
-ok "parallel: a2 got P2, not P1" "has '$(chg a2)' P2 && nothas '$(chg a2)' P1"
+ok "a1 got its file, not a2's" "has '$(chg a1)' A1-add && nothas '$(chg a1)' A2-add"
+ok "a2 got its file, not a1's" "has '$(chg a2)' A2-add && nothas '$(chg a2)' A1-add"
 
 echo "== C: a NON-tool (Bash/human) edit does NOT leak into the agent's change =="
 new_repo c

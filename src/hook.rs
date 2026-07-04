@@ -16,7 +16,6 @@ use std::path::Path;
 
 use crate::identity::{from_payload, ENV_VAR};
 use crate::jj::Jj;
-use crate::lock::RepoLock;
 use crate::paths::{central_root, ensure_data_dir, find_repo_root, relpath_within};
 use crate::state::State;
 
@@ -72,28 +71,33 @@ fn dispatch(payload: &Value) {
             return;
         }
     };
-    let _guard = match RepoLock::acquire(&base_dir) {
-        Ok(g) => g,
-        Err(e) => {
-            log_error(&format!("lock: {e}"));
-            return;
-        }
-    };
-    let mut state = State::load(&base_dir);
-    // Opt-in: only sessions that ran `jj collect` have a bound change.
-    if !state.bindings.contains_key(&agent) {
+    // Opt-in (read-only check): only sessions that ran `jj collect` participate,
+    // and only those take the edit lock, so a non-collecting session never blocks.
+    if !State::load(&base_dir).bindings.contains_key(&agent) {
         return;
     }
     let jj = Jj::new(&root);
     let paths = edited_paths(payload, &|p| relpath_within(p, &root));
-    if paths.is_empty() {
-        return;
-    }
 
     if event == "PreToolUse" {
-        pre_tool(&jj, &mut state, &base_dir, &paths);
+        // Take the edit lock and hold it *past this process* — PostToolUse
+        // releases it. A blocked peer PreToolUse blocks its tool, so no other
+        // edit can write until this one's whole bracket completes.
+        crate::lock::acquire(&base_dir, &agent);
+        if !paths.is_empty() {
+            // Load state fresh *under* the lock: ensure_holding saves it, and a
+            // read from before the lock could clobber a peer's just-added binding.
+            let mut state = State::load(&base_dir);
+            pre_tool(&jj, &mut state, &base_dir, &paths);
+        }
     } else {
-        post_tool(&jj, &state, &agent, &paths);
+        if !paths.is_empty() {
+            let state = State::load(&base_dir);
+            post_tool(&jj, &state, &agent, &paths);
+        }
+        // Always release: this session held the lock since PreToolUse, even if
+        // there was nothing to squash or the change vanished.
+        crate::lock::release(&base_dir, &agent);
     }
 }
 
@@ -108,8 +112,8 @@ fn pre_tool(jj: &Jj, state: &mut State, base_dir: &Path, paths: &[String]) {
     };
     jj.file_track(paths);
     jj.snapshot();
-    // Path-scoped: only the about-to-be-edited files move; a peer's other file
-    // stays in `@`. A no-op (files already clean) is fine and ignored.
+    // Path-scoped: only the about-to-be-edited files move. A no-op (files
+    // already clean) is fine and ignored.
     let _ = jj.squash_paths_into(&holding, paths);
 }
 
