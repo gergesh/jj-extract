@@ -47,6 +47,11 @@ cid() { echo "$BUILT" | grep "session $1 " | grep -oE 'change [0-9a-z]+' | head 
 addedlines() { jj diff -r "$1" --git 2>/dev/null | grep '^+' | grep -v '^+++'; }
 has() { addedlines "$1" | grep -q "$2"; }
 nothas() { ! addedlines "$1" | grep -q "$2"; }
+# One-session extract, echoing just the built change id.
+extract_one() { "$BIN" 2>&1 | grep "session $1 " | grep -oE 'change [0-9a-z]+' | head -1 | awk '{print $2}'; }
+# How many extracted changes carry a given session's trailer.
+n_extractions() { jj log -r "description(substring:\"jj-extract-session: $1\")" --no-graph -T 'change_id.short() ++ "\n"' 2>/dev/null | grep -c .; }
+n_divergent() { jj log -r 'all()' --no-graph -T 'if(divergent,"X","")' 2>/dev/null | grep -c X; }
 
 echo "== A: sequential interleaved edits to the SAME file (line numbers shift) =="
 new_repo a
@@ -92,6 +97,20 @@ edit a1 g.txt $'first line\n'                          # create a new file
 edit a1 g.txt $'first line\nsecond line\n'             # extend it
 extract_all
 ok "new-file create+extend both collected" "has '$(cid a1)' 'first line' && has '$(cid a1)' 'second line'"
+
+echo "== F: re-running extract updates in place (idempotent), no duplicates =="
+new_repo f
+edit a1 f.txt $'l1\nl2\nl3\nONE\n'
+ID1="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
+ID2="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"                 # re-run, no new edits
+ok "re-extract makes no duplicate (one change)" "[ \"$(n_extractions a1)\" = 1 ]"
+ok "re-extract preserves the change id"         "[ -n \"$ID1\" ] && [ \"$ID1\" = \"$ID2\" ]"
+edit a1 f.txt $'TOP\nl1\nl2\nl3\nONE\n'                     # a later edit...
+ID3="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"                 # ...update-in-place picks it up
+ok "re-extract still one change after new edit"  "[ \"$(n_extractions a1)\" = 1 ]"
+ok "updated change keeps the stable id"          "[ \"$ID1\" = \"$ID3\" ]"
+ok "updated change reflects the later edit"      "has '$ID3' TOP && has '$ID3' ONE"
+ok "extract leaves no divergent commits"         "[ \"$(n_divergent)\" = 0 ]"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

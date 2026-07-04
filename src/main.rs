@@ -116,7 +116,13 @@ fn cmd_extract(message: Option<String>, agent_opt: Option<String>, all: bool) ->
     let orig = jj.change_id("@");
     let mut built = vec![];
     for (agent, msg) in &targets {
-        if let Some(b) = construct::build_one(&jj, &base, agent, &evolog, msg.as_deref()) {
+        if let Some(mut b) = construct::build_one(&jj, &base, agent, &evolog, msg.as_deref()) {
+            // Idempotency: if this session was already extracted, update that
+            // change in place instead of leaving a duplicate behind.
+            let (id, updated) =
+                construct::reconcile_idempotent(&jj, agent, &b.change_id, msg.as_deref());
+            b.change_id = id;
+            b.updated = updated;
             built.push(b);
         }
     }
@@ -138,12 +144,10 @@ fn cmd_extract(message: Option<String>, agent_opt: Option<String>, all: bool) ->
                 b.change_id
             );
         } else {
+            let verb = if b.updated { green("↻ updated") } else { green("✓ extracted") };
             println!(
                 "{} session {} → change {} on base (inspect: jj show {})",
-                green("✓ extracted"),
-                b.session,
-                b.change_id,
-                b.change_id
+                verb, b.session, b.change_id, b.change_id
             );
         }
     }

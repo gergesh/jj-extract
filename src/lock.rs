@@ -12,6 +12,14 @@
 //! crashes (no PostToolUse) would wedge all editing forever. So the lock is
 //! time-bounded: a holder older than `STALE_SECS` is treated as dead and stolen.
 //! Edit tool executions are milliseconds, so the window is safe.
+//!
+//! The lock is *published atomically with its content*: we write `ts holder`
+//! into a private temp file and then `hard_link` it into place. `hard_link` is
+//! atomic and fails if the target exists, so the lock never exists in an empty
+//! state. A plain `create_new` + later `write` would expose that empty window:
+//! a racing peer's `create_new` fails, it reads the still-empty file, sees
+//! unparseable content, treats it as stale, and steals a lock a live holder is
+//! mid-way through taking — letting both proceed at once.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -38,11 +46,17 @@ fn lock_path(base: &Path) -> PathBuf {
 pub fn acquire(base: &Path, holder: &str) {
     let _ = fs::create_dir_all(base);
     let path = lock_path(base);
+    // A private, fully-written temp file we publish via an atomic `hard_link`, so
+    // the lock is never observable in a half-written (empty) state.
+    let tmp = base.join(format!("jj-extract.{}.tmp", std::process::id()));
     let mut waited = 0u64;
     loop {
-        match OpenOptions::new().create_new(true).write(true).open(&path) {
-            Ok(mut f) => {
-                let _ = write!(f, "{} {}", now(), holder);
+        if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp) {
+            let _ = write!(f, "{} {}", now(), holder);
+        }
+        match fs::hard_link(&tmp, &path) {
+            Ok(_) => {
+                let _ = fs::remove_file(&tmp);
                 return;
             }
             Err(_) => {

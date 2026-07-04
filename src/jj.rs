@@ -124,6 +124,23 @@ impl Jj {
         self.run(&["restore", "--from", rev])
     }
 
+    /// Overwrite `into`'s tree with `from`'s (all files), preserving `into`'s
+    /// change id and description — used to update a prior extraction in place.
+    pub fn restore_into(&self, into: &str, from: &str) -> Run {
+        self.run(&["restore", "--from", from, "--into", into])
+    }
+
+    /// Change ids of visible commits whose description contains `needle`.
+    pub fn changes_with_description(&self, needle: &str) -> Vec<String> {
+        let pat = serde_json::to_string(needle).unwrap_or_default();
+        let revset = format!("description(substring:{pat})");
+        let r = self.run(&["log", "-r", &revset, "--no-graph", "-T", r#"change_id.short() ++ "\n""#]);
+        if !r.ok {
+            return vec![];
+        }
+        r.stdout.lines().map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    }
+
     pub fn new_empty(&self) -> Run {
         self.run(&["new"])
     }

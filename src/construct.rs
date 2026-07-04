@@ -13,6 +13,50 @@ pub struct Built {
     pub session: String,
     pub change_id: String,
     pub conflict: bool,
+    /// True when this folded into a prior extraction of the same session
+    /// (idempotent re-run) rather than minting a fresh change.
+    pub updated: bool,
+}
+
+/// A stable, machine-readable trailer line identifying which session an extracted
+/// change belongs to. It's independent of the human `-m` message, so re-running
+/// `jj extract` can find its own prior output regardless of the description.
+pub fn session_trailer(session: &str) -> String {
+    format!("jj-extract-session: {session}")
+}
+
+/// The description put on an extracted change: the user's message (or a default
+/// first line) plus the [`session_trailer`] so re-runs are idempotent.
+fn extraction_desc(session: &str, message: Option<&str>) -> String {
+    let body = message.map(|m| m.to_string()).unwrap_or_else(|| format!("jj-extract: {session}"));
+    format!("{body}\n\n{}", session_trailer(session))
+}
+
+/// Fold a freshly-built change into any prior extraction of the same session so a
+/// re-run *updates in place* instead of piling up duplicates. The prior change
+/// keeps its id (and any descendants the user built on it); its content and
+/// description are replaced with the fresh build, and the fresh change (plus any
+/// extra stale duplicates) is abandoned. Returns `(surviving_change_id, updated)`.
+pub fn reconcile_idempotent(
+    jj: &Jj,
+    session: &str,
+    fresh: &str,
+    message: Option<&str>,
+) -> (String, bool) {
+    let trailer = session_trailer(session);
+    let priors: Vec<String> =
+        jj.changes_with_description(&trailer).into_iter().filter(|c| c != fresh).collect();
+    let existing = match priors.first() {
+        Some(e) => e,
+        None => return (fresh.to_string(), false),
+    };
+    jj.restore_into(existing, fresh); // existing's tree ← fresh's tree
+    jj.describe(existing, &extraction_desc(session, message));
+    jj.abandon(fresh);
+    for extra in &priors[1..] {
+        jj.abandon(extra); // collapse any earlier duplicates too
+    }
+    (existing.clone(), true)
 }
 
 /// The agents present in the evolog: every tagging user except the neutral one
@@ -91,8 +135,7 @@ pub fn build_one(
     for s in &scaffolds {
         jj.abandon(s); // childless now (their deltas were rebased away)
     }
-    let desc = message.map(|m| m.to_string()).unwrap_or_else(|| format!("jj-extract: {session}"));
-    jj.describe(&change, &desc);
+    jj.describe(&change, &extraction_desc(session, message));
     let conflict = jj.is_conflict(&change);
-    Some(Built { session: session.to_string(), change_id: change, conflict })
+    Some(Built { session: session.to_string(), change_id: change, conflict, updated: false })
 }
