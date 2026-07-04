@@ -1,11 +1,11 @@
-//! Who is "me"? An agent is identified by `$JJ_COLLECT_AGENT` (set per-process
+//! Who is "me"? An agent is identified by `$JJ_EXTRACT_AGENT` (set per-process
 //! for deliberately-named agents) or, failing that, the Claude `session_id`
 //! (distinct per top-level `claude` process).
 
-pub const ENV_VAR: &str = "JJ_COLLECT_AGENT";
+pub const ENV_VAR: &str = "JJ_EXTRACT_AGENT";
 
 /// Resolve the acting agent from a hook payload's `session_id`, letting an
-/// explicit `$JJ_COLLECT_AGENT` win.
+/// explicit `$JJ_EXTRACT_AGENT` win.
 pub fn from_payload(session_id: Option<&str>) -> String {
     if let Ok(v) = std::env::var(ENV_VAR) {
         if !v.is_empty() {

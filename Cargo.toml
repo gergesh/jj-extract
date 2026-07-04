@@ -1,13 +1,13 @@
 [package]
-name = "jj-collect"
+name = "jj-extract"
 version = "0.1.0"
 edition = "2021"
-description = "Per-agent change attribution for a shared jj working copy: each agent's edits auto-collect into their own jj change."
+description = "Per-agent change attribution for a shared jj working copy: edits are recorded into jj's evolog, then `jj extract` pulls each agent's edits into their own change."
 license = "MIT"
 
-# Binary named `jj-collect` so `jj collect …` invokes it as a native jj subcommand.
+# Binary named `jj-extract` so `jj extract …` invokes it as a native jj subcommand.
 [[bin]]
-name = "jj-collect"
+name = "jj-extract"
 path = "src/main.rs"
 
 [dependencies]

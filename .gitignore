@@ -1,6 +1,5 @@
 # Rust
 /target/
 
-# jj-collect writes state centrally under ~/.claude/jj-collect/, never in-repo,
-# but ignore a stray lock just in case.
-*.jj-collect-bak
+# jj-extract keeps its lock centrally under ~/.claude/jj-extract/, never in-repo.
+*.jj-extract-bak

@@ -1,15 +1,13 @@
-//! Thin, well-defined wrappers over the `jj` CLI. Two roles:
+//! Thin wrappers over the `jj` CLI. Two roles:
 //!
-//! * **Record** (hooks): `snapshot_commit` runs `jj log -r @` which snapshots the
-//!   working copy as a side effect and returns `@`'s commit id — one cheap call
-//!   that captures the current on-disk state as a content-addressed pointer.
-//! * **Construct** (harvest): replay recorded (pre, post) snapshots into an
-//!   isolated per-agent change — `new_on` a recorded pre, overwrite the edited
-//!   files with their post content, snapshot to get a delta commit, then
-//!   `rebase`/`squash` it so jj's 3-way merge composes each agent's edits.
-//!
-//! Invariant: recorded snapshot commit ids stay diff-/rebase-able after `@` moves
-//! on (jj's store keeps them), which is what makes deferred construction work.
+//! * **Record** (hooks): each edit is captured as a working-copy snapshot whose
+//!   *operation* is tagged with the acting agent (`JJ_OP_USERNAME`). jj's evolog
+//!   then carries the attribution itself — `jj evolog -r @` lists every
+//!   evolution of `@` with the operation (and thus agent) that made it. No
+//!   sidecar: the op log is the ledger.
+//! * **Construct** (harvest): read the evolog, and for each of an agent's
+//!   evolutions replay `diff(previous, this)` as a delta commit rebased onto
+//!   base, letting jj's 3-way merge compose the agent's edits.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,23 +21,25 @@ pub struct Run {
     pub stdout: String,
 }
 
+/// One evolution of `@`: its commit id and the username on the operation that
+/// created it (i.e. the agent we tagged, or a neutral default).
+pub struct Evolution {
+    pub commit: String,
+    pub user: String,
+}
+
 impl Jj {
     pub fn new(root: &Path) -> Jj {
         Jj { root: root.to_path_buf() }
     }
 
-    pub fn root_path(&self) -> &Path {
-        &self.root
-    }
-
-    /// Run `jj <args>` in the repo, never opening an editor or a pager.
-    pub fn run(&self, args: &[&str]) -> Run {
-        let out = Command::new("jj")
-            .args(args)
-            .current_dir(&self.root)
-            .env("JJ_EDITOR", "true")
-            .output();
-        match out {
+    fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> Run {
+        let mut cmd = Command::new("jj");
+        cmd.args(args).current_dir(&self.root).env("JJ_EDITOR", "true");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        match cmd.output() {
             Ok(o) => Run {
                 ok: o.status.success(),
                 stdout: String::from_utf8_lossy(&o.stdout).to_string(),
@@ -48,65 +48,102 @@ impl Jj {
         }
     }
 
-    // --- record --------------------------------------------------------------
-
-    /// Snapshot the working copy into `@` and return `@`'s commit id. `jj log`
-    /// snapshots as a side effect, so this both captures the current on-disk
-    /// state and yields the content-addressed pointer to it — in one call.
-    pub fn snapshot_commit(&self) -> Option<String> {
-        // Track first so `auto-track=none` doesn't hide newly-created files from
-        // the snapshot. (Untracked-but-existing files are made visible.)
-        let r = self.run(&["log", "-r", "@", "-T", "commit_id.short()", "--no-graph"]);
-        let id = r.stdout.trim().to_string();
-        (r.ok && !id.is_empty()).then_some(id)
+    pub fn run(&self, args: &[&str]) -> Run {
+        self.run_env(args, &[])
     }
 
-    /// Track the given (existing) paths, so `auto-track=none` repos still see
-    /// newly-created files in the next snapshot. Missing paths are skipped.
-    pub fn file_track(&self, paths: &[String]) {
+    // --- record --------------------------------------------------------------
+
+    /// Snapshot the working copy under a *neutral* operation (default user), so
+    /// whatever is on disk right now — a Bash/human/peer change — becomes an
+    /// unattributed evolution and won't fold into the next agent's edit.
+    pub fn snapshot_neutral(&self) {
+        let _ = self.run(&["status"]);
+    }
+
+    /// Snapshot the working copy under an operation tagged with `agent`, so this
+    /// becomes the agent's evolution in the evolog.
+    ///
+    /// A plain `jj status` tags the snapshot op correctly but won't pick up a
+    /// newly-created file (`auto-track=none`); `jj file track` picks it up but
+    /// does the content snapshot in a *separate untagged* op. So we snapshot with
+    /// `snapshot.auto-track` scoped to the edited file — that both tracks it and
+    /// tags the snapshot. One snapshot per file (edits are ~always single-file);
+    /// each is a tagged evolution, and the builder composes them.
+    pub fn snapshot_tagged(&self, agent: &str, paths: &[String]) {
+        let env = [("JJ_OP_USERNAME", agent)];
         let existing: Vec<&str> =
             paths.iter().filter(|p| self.root.join(p).exists()).map(|s| s.as_str()).collect();
         if existing.is_empty() {
+            let _ = self.run_env(&["status"], &env);
             return;
         }
-        let mut args = vec!["file", "track", "--"];
-        args.extend(existing);
-        let _ = self.run(&args);
+        for p in existing {
+            // `{:?}` quotes the path; jj reads the --config value as the fileset
+            // to auto-track for this snapshot (unrelated untracked files stay out).
+            let cfg = format!("snapshot.auto-track={p:?}");
+            let _ = self.run_env(&["--config", &cfg, "status"], &env);
+        }
     }
 
     // --- construct -----------------------------------------------------------
 
-    /// Check out `rev`'s content into a fresh working copy (`jj new <rev>`).
+    /// `@`'s evolutions, oldest first, each with the tagging operation's user.
+    pub fn evolog(&self) -> Vec<Evolution> {
+        let r = self.run(&[
+            "evolog",
+            "-r",
+            "@",
+            "-T",
+            r#"commit.commit_id().short() ++ " " ++ operation.user() ++ "\n""#,
+            "--no-graph",
+        ]);
+        if !r.ok {
+            return vec![];
+        }
+        let mut evos: Vec<Evolution> = r
+            .stdout
+            .lines()
+            .filter_map(|l| {
+                let (commit, user) = l.trim().split_once(' ')?;
+                // op.user() is "name@host"; keep the name.
+                let user = user.split('@').next().unwrap_or(user);
+                Some(Evolution { commit: commit.to_string(), user: user.to_string() })
+            })
+            .collect();
+        evos.reverse(); // evolog is newest-first; we want chronological
+        evos
+    }
+
     pub fn new_on(&self, rev: &str) -> Run {
         self.run(&["new", rev])
     }
 
-    /// Create a fresh empty child of `@` (moves `@` off whatever it was).
+    /// Make the working copy's content equal to `rev`'s (all files).
+    pub fn restore_from(&self, rev: &str) -> Run {
+        self.run(&["restore", "--from", rev])
+    }
+
     pub fn new_empty(&self) -> Run {
         self.run(&["new"])
     }
 
-    /// Snapshot the working copy (no output needed).
     pub fn snapshot(&self) {
         let _ = self.run(&["status"]);
     }
 
-    /// The content of `path` at `rev`, or None if it doesn't exist there.
-    pub fn file_show(&self, rev: &str, path: &str) -> Option<String> {
-        let r = self.run(&["file", "show", "-r", rev, path]);
-        r.ok.then_some(r.stdout)
-    }
-
-    /// Rebase `change` (and only it) onto `dest`, letting jj's 3-way merge apply
-    /// its diff there. Conflicts (genuine same-region overlap) are recorded in
-    /// the result rather than merged away.
     pub fn rebase_onto(&self, change: &str, dest: &str) -> Run {
         self.run(&["rebase", "-r", change, "-d", dest])
     }
 
-    /// Squash `from`'s changes down into `into`, keeping `into`'s description.
     pub fn squash_into(&self, from: &str, into: &str) -> Run {
         self.run(&["squash", "--from", from, "--into", into, "--use-destination-message"])
+    }
+
+    /// Restore the working copy to `rev` in place, preserving its change id (and
+    /// thus its evolog) — used to return `@` to the live state after harvest.
+    pub fn edit(&self, rev: &str) -> Run {
+        self.run(&["edit", rev])
     }
 
     // --- queries -------------------------------------------------------------

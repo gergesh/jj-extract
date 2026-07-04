@@ -1,18 +1,16 @@
-//! jj-collect — record each Claude session's edits and construct a per-agent jj
-//! change from them, so agents sharing one working copy each get their own commit.
+//! jj-extract — agents share one jj working copy; each edit is recorded into
+//! jj's evolog (tagged with the acting session), and `jj extract` pulls a
+//! session's edits into their own jj change — isolated at line granularity, with
+//! jj's rebase doing the content math.
 //!
-//! Two halves, deliberately decoupled:
-//!   * **record** — `jj collect` marks a session; a hook then snapshots `@` around
-//!     each edit (via jj itself) and appends a cheap `(pre, post, files)` record.
-//!     No stack mutation, no lock — so any number of agents record concurrently.
-//!   * **construct** — `jj collect --build` replays each session's records into an
-//!     isolated change, single-threaded, letting jj's rebase do the content math.
+//! Recording is automatic (a hook tags every edit's snapshot); there's nothing
+//! to start. `jj extract` is a `jj new`-style wrapper that mints a change and
+//! composes the acting session's tagged evolutions into it.
 //!
 //! Usage:
-//!   jj collect [-m MSG]            start recording this session's edits
-//!   jj collect --build [--agent A] build the change from what was recorded
-//!   jj collect --build --all       build every collecting session's change
-//!   jj-collect --install/--uninstall/--hook   plumbing
+//!   jj extract [-m MSG]           pull my edits into their own change
+//!   jj extract --all              build a change for every session in the evolog
+//!   jj-extract --install/--uninstall/--hook   plumbing
 
 mod construct;
 mod hook;
@@ -21,7 +19,6 @@ mod install;
 mod jj;
 mod lock;
 mod paths;
-mod store;
 
 use clap::Parser;
 use std::io::IsTerminal;
@@ -34,15 +31,15 @@ use paths::{ensure_data_dir, find_repo_root};
 
 #[derive(Parser)]
 #[command(
-    name = "jj-collect",
-    about = "Record this Claude session's edits and build them into their own jj change.",
+    name = "jj-extract",
+    about = "Pull this Claude session's recorded edits into their own jj change.",
     version
 )]
 struct Cli {
     /// Hook entry point (reads hook JSON on stdin; used in settings.json).
     #[arg(long, hide = true)]
     hook: bool,
-    /// Register the hooks in Claude settings, plus `jj collect` as a jj alias.
+    /// Register the hooks in Claude settings, plus `jj extract` as a jj alias.
     #[arg(long, conflicts_with = "uninstall")]
     install: bool,
     /// Remove the hooks and the jj alias.
@@ -51,16 +48,13 @@ struct Cli {
     /// With --install/--uninstall: target this repo's settings, not the global file.
     #[arg(long)]
     project: bool,
-    /// Construct the collected change(s) from the recorded edits.
-    #[arg(long)]
-    build: bool,
-    /// With --build: build every collecting session, not just this one.
+    /// Extract a change for every session found in the evolog, not just this one.
     #[arg(long)]
     all: bool,
-    /// Description for the change (recorded now, applied at --build).
+    /// Description for the extracted change.
     #[arg(short = 'm', long)]
     message: Option<String>,
-    /// Session to act as (default: $JJ_COLLECT_AGENT, set by the SessionStart hook).
+    /// Session to extract (default: $JJ_EXTRACT_AGENT, set by the SessionStart hook).
     #[arg(long)]
     agent: Option<String>,
 }
@@ -73,54 +67,16 @@ fn main() {
         cmd_install(cli.project)
     } else if cli.uninstall {
         cmd_uninstall(cli.project)
-    } else if cli.build {
-        cmd_build(cli.agent, cli.all)
     } else {
-        cmd_collect(cli.message, cli.agent)
+        cmd_extract(cli.message, cli.agent, cli.all)
     };
     exit(code);
 }
 
 // --------------------------------------------------------------------------- //
-// record
+// extract — the one command agents use
 // --------------------------------------------------------------------------- //
-fn cmd_collect(message: Option<String>, agent_opt: Option<String>) -> i32 {
-    let root = match repo_root() {
-        Some(r) => r,
-        None => {
-            err("Not inside a jj repo.");
-            return 2;
-        }
-    };
-    let agent = match resolve_agent(agent_opt) {
-        Some(a) => a,
-        None => return 2,
-    };
-    let base_dir = match ensure_data_dir(&root) {
-        Ok(b) => b,
-        Err(e) => {
-            err(&format!("could not create data dir: {e}"));
-            return 1;
-        }
-    };
-    let jj = Jj::new(&root);
-    // The construction floor is the working copy as it is right now, before this
-    // session edits — recorded once, shared by every session.
-    if let Some(c) = jj.snapshot_commit() {
-        store::base_set_once(&base_dir, &c);
-    }
-    store::session_start(&base_dir, &agent, message.as_deref());
-    println!(
-        "{} session {agent}: recording edits — run `jj collect --build` when done",
-        green("✓")
-    );
-    0
-}
-
-// --------------------------------------------------------------------------- //
-// construct
-// --------------------------------------------------------------------------- //
-fn cmd_build(agent_opt: Option<String>, all: bool) -> i32 {
+fn cmd_extract(message: Option<String>, agent_opt: Option<String>, all: bool) -> i32 {
     let root = match repo_root() {
         Some(r) => r,
         None => {
@@ -135,59 +91,64 @@ fn cmd_build(agent_opt: Option<String>, all: bool) -> i32 {
             return 1;
         }
     };
-    let base = match store::base_get(&base_dir) {
+    let jj = Jj::new(&root);
+    // Hold the edit lock while we read the evolog and construct: it stops a
+    // concurrent hook from snapshotting `@` into the build's intermediate states.
+    let _guard = lock::Guard::new(&base_dir, "extract");
+
+    let evolog = jj.evolog();
+    // The extracted change branches from `@`'s parent — the commit the working
+    // copy is built on, i.e. the state before any editing. So the change holds
+    // only the agent's own edits, not other agents' work nor the live `@`.
+    let base = match jj.change_id("@-") {
         Some(b) => b,
         None => {
-            println!("Nothing collected yet.");
+            println!("Nothing recorded yet.");
             return 0;
         }
     };
-    let jj = Jj::new(&root);
-    // One builder at a time (construction moves the working copy around).
-    let _guard = lock::Guard::new(&base_dir, "build");
 
     let targets: Vec<(String, Option<String>)> = if all {
-        store::sessions(&base_dir)
-            .into_iter()
-            .map(|s| {
-                let m = store::session_message(&base_dir, &s);
-                (s, m)
-            })
-            .collect()
+        construct::agents_in(&evolog).into_iter().map(|a| (a, None)).collect()
     } else {
         let agent = match resolve_agent(agent_opt) {
             Some(a) => a,
             None => return 2,
         };
-        let m = store::session_message(&base_dir, &agent);
-        vec![(agent, m)]
+        vec![(agent, message)]
     };
 
-    let events = store::events(&base_dir);
-    let orig = jj.snapshot_commit(); // the live, all-agents working copy
-    let built = construct::build_all(&jj, &base, &targets, &events, orig.as_deref());
+    // Remember the live working copy so we can restore `@` after building moves it.
+    let orig = jj.change_id("@");
+    let mut built = vec![];
+    for (agent, msg) in &targets {
+        if let Some(b) = construct::build_one(&jj, &base, agent, &evolog, msg.as_deref()) {
+            built.push(b);
+        }
+    }
+    if let Some(o) = &orig {
+        let _ = jj.edit(o);
+    }
 
     if built.is_empty() {
-        println!("Nothing to build for the requested session(s).");
+        println!("Nothing to extract for the requested session(s).");
         return 0;
     }
     for b in built {
         if b.conflict {
             println!(
-                "{} session {} → change {} — {} file(s) (inspect: jj show {})",
-                yellow("⚠ built WITH CONFLICTS:"),
+                "{} session {} → change {} (inspect: jj show {})",
+                yellow("⚠ extracted WITH CONFLICTS:"),
                 b.session,
                 b.change_id,
-                b.files,
                 b.change_id
             );
         } else {
             println!(
-                "{} session {} → change {} on base — {} file(s) (inspect: jj show {})",
-                green("✓ built"),
+                "{} session {} → change {} on base (inspect: jj show {})",
+                green("✓ extracted"),
                 b.session,
                 b.change_id,
-                b.files,
                 b.change_id
             );
         }
@@ -208,9 +169,9 @@ fn cmd_install(project: bool) -> i32 {
             println!("{} hooks ({scope}) → {}", green(verb), target.display());
             println!("  command:  {full}");
             if set_jj_alias() {
-                println!("  alias:    `jj collect …` (jj user config → aliases.collect)");
+                println!("  alias:    `jj extract …` (jj user config → aliases.extract)");
             }
-            println!("\nAgents: run `jj collect -m \"<task>\"` before editing, `jj collect --build` when done.");
+            println!("\nRecording is automatic. Agents run `jj extract -m \"<task>\"` to pull their change.");
             0
         }
         Err(e) => {
@@ -240,11 +201,13 @@ fn cmd_uninstall(project: bool) -> i32 {
     }
 }
 
+/// Register `jj extract …` as a jj user alias that shells out to this binary via
+/// `jj util exec` (the documented pattern for external jj subcommands).
 fn set_jj_alias() -> bool {
     let exe = current_exe();
     let value = serde_json::to_string(&["util", "exec", "--", exe.as_str()]).unwrap();
     std::process::Command::new("jj")
-        .args(["config", "set", "--user", "aliases.collect", &value])
+        .args(["config", "set", "--user", "aliases.extract", &value])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -252,7 +215,7 @@ fn set_jj_alias() -> bool {
 
 fn unset_jj_alias() {
     let _ = std::process::Command::new("jj")
-        .args(["config", "unset", "--user", "aliases.collect"])
+        .args(["config", "unset", "--user", "aliases.extract"])
         .status();
 }
 
@@ -270,7 +233,7 @@ fn resolve_agent(explicit: Option<String>) -> Option<String> {
         None => {
             err(&format!(
                 "Could not determine which session you are. Pass --agent <id> or set ${ENV_VAR}.\n\
-                 (The SessionStart hook sets it automatically once `jj-collect --install` has run.)"
+                 (The SessionStart hook sets it automatically once `jj-extract --install` has run.)"
             ));
             None
         }
@@ -278,7 +241,7 @@ fn resolve_agent(explicit: Option<String>) -> Option<String> {
 }
 
 fn current_exe() -> String {
-    std::env::current_exe().ok().map(|p| p.display().to_string()).unwrap_or_else(|| "jj-collect".to_string())
+    std::env::current_exe().ok().map(|p| p.display().to_string()).unwrap_or_else(|| "jj-extract".to_string())
 }
 
 fn default_settings_path(project: bool) -> PathBuf {

@@ -1,8 +1,8 @@
 //! Repo discovery and the central data directory.
 //!
-//! jj-collect stores its state centrally under `~/.claude/jj-collect/<repo>-<hash>/`
-//! rather than inside the repo, so recording can be on everywhere without
-//! littering working trees. `JJ_COLLECT_HOME` relocates the root.
+//! jj-extract keeps its lock centrally under `~/.claude/jj-extract/<repo>-<hash>/`
+//! rather than inside the repo, so nothing is littered into working trees.
+//! `JJ_EXTRACT_HOME` relocates the root.
 
 use std::path::{Path, PathBuf};
 
@@ -18,13 +18,13 @@ pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Root of central storage: `$JJ_COLLECT_HOME` or `~/.claude/jj-collect`.
+/// Root of central storage: `$JJ_EXTRACT_HOME` or `~/.claude/jj-extract`.
 pub fn central_root() -> PathBuf {
-    if let Some(over) = std::env::var_os("JJ_COLLECT_HOME") {
+    if let Some(over) = std::env::var_os("JJ_EXTRACT_HOME") {
         return PathBuf::from(over);
     }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".claude").join("jj-collect")
+    home.join(".claude").join("jj-extract")
 }
 
 /// Deterministic per-repo data dir: same repo root → same directory.

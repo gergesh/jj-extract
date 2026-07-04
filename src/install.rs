@@ -1,4 +1,4 @@
-//! Register / unregister the jj-collect hooks in Claude Code settings.json,
+//! Register / unregister the jj-extract hooks in Claude Code settings.json,
 //! preserving every other key and any pre-existing hooks.
 
 use serde_json::{json, Value};
@@ -14,7 +14,7 @@ const REGISTRATIONS: [(&str, Option<&str>); 3] = [
 ];
 
 fn is_our_hook(command: &str) -> bool {
-    command.contains("jj-collect") && command.contains("hook")
+    command.contains("jj-extract") && command.contains("hook")
 }
 
 /// Idempotently add our hooks. Returns true if anything changed.

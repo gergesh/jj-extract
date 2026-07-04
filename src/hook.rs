@@ -1,8 +1,16 @@
-//! Claude Code hook entry point (`jj-collect --hook`). Reads the hook JSON on
-//! stdin and, for a session that opted in via `jj collect`, **records** a cheap
-//! snapshot pointer around each edit. It never mutates the collect stack and
-//! takes no lock — the only shared thing it touches is jj's working-copy
-//! snapshot (which jj serializes itself), so concurrent agents don't contend.
+//! Claude Code hook entry point (`jj-extract --hook`). Records each edit as an
+//! agent-tagged jj snapshot; jj's evolog is the attributed ledger. Recording is
+//! automatic — no opt-in — so `jj extract` can pull any session's edits later.
+//!
+//! Only `Edit`/`Write`/`MultiEdit` are hooked — a Bash/other tool's file effects
+//! are never collected. They're flushed to an *unattributed* evolution by the
+//! neutral pre-snapshot, so they can't fold into an agent's change.
+//!
+//! Each edit is bracketed by the **edit lock** (Pre takes it, Post releases it),
+//! so a peer can't write while this edit is in flight — the agent's snapshot then
+//! captures only its own edit. The lock guards just a fast write+snapshot, so
+//! holding it across the tool is cheap, and it's uncontended when a session is
+//! editing alone.
 //!
 //! Contract: never interfere with the tool call — always exit 0, emit nothing on
 //! stdout, swallow every error (logged best-effort).
@@ -14,7 +22,6 @@ use std::path::Path;
 use crate::identity::{from_payload, ENV_VAR};
 use crate::jj::Jj;
 use crate::paths::{central_root, ensure_data_dir, find_repo_root, relpath_within};
-use crate::store::{self, Event};
 
 const FILE_TOOLS: [&str; 3] = ["Edit", "Write", "MultiEdit"];
 
@@ -43,6 +50,7 @@ fn dispatch(payload: &Value) {
     if event != "PreToolUse" && event != "PostToolUse" {
         return;
     }
+    // Only file-editing tools; a Bash/other tool's effects are never collected.
     let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");
     if !FILE_TOOLS.contains(&tool) {
         return;
@@ -66,35 +74,21 @@ fn dispatch(payload: &Value) {
             return;
         }
     };
-    // Opt-in: only a session that ran `jj collect` is recorded.
-    if !store::session_active(&base_dir, &agent) {
-        return;
-    }
     let jj = Jj::new(&root);
 
     if event == "PreToolUse" {
-        // Capture the pre-image: snapshot @ and stash its commit id for Post.
-        if let Some(pre) = jj.snapshot_commit() {
-            store::pending_set(&base_dir, &agent, &pre);
-        }
+        // Hold the edit lock across the write (released at PostToolUse) so no peer
+        // writes meanwhile. The neutral snapshot flushes anything already on disk
+        // (a Bash/human change) to an unattributed evolution.
+        crate::lock::acquire(&base_dir, &agent);
+        jj.snapshot_neutral();
         return;
     }
 
-    // PostToolUse: track (so new files are visible), snapshot the post-image, and
-    // append the (pre, post, files) tool-use record.
+    // PostToolUse: capture the edit as this agent's evolution, then release.
     let files = edited_paths(payload, &|p| relpath_within(p, &root));
-    if files.is_empty() {
-        return;
-    }
-    jj.file_track(&files);
-    let post = match jj.snapshot_commit() {
-        Some(p) => p,
-        None => return,
-    };
-    // If Pre didn't run, fall back to the post itself as pre (records an empty
-    // delta rather than mis-attributing).
-    let pre = store::pending_take(&base_dir, &agent).unwrap_or_else(|| post.clone());
-    store::event_append(&base_dir, &Event { session: agent, pre, post, files });
+    jj.snapshot_tagged(&agent, &files);
+    crate::lock::release(&base_dir, &agent);
 }
 
 /// Extract repo-relative edited paths from a tool payload (Edit/Write/MultiEdit).
