@@ -1,16 +1,15 @@
-//! Thin, well-defined wrappers over the `jj` CLI. Every sequence here was
-//! validated against jj 0.42 before being encoded.
+//! Thin, well-defined wrappers over the `jj` CLI. Two roles:
 //!
-//! Invariants relied on elsewhere:
-//! * `jj` change ids are stable across the rebases/squashes we perform.
-//! * We never pass `--ignore-working-copy` on a `@`-rewriting command: doing so
-//!   desyncs the on-disk working copy ("stale working copy"). We let jj manage
-//!   the working copy and serialize with an external lock instead.
-//! * We never *move* the shared `@`. All agents share one working copy; a
-//!   collecting change is inserted *beneath* `@`, which stays a neutral scratch
-//!   so a peer's not-yet-squashed edit is never absorbed into the wrong change.
-//! * `snapshot.auto-track=none` is common, so new files are invisible until
-//!   `jj file track`ed — we track an agent's paths before squashing them.
+//! * **Record** (hooks): `snapshot_commit` runs `jj log -r @` which snapshots the
+//!   working copy as a side effect and returns `@`'s commit id — one cheap call
+//!   that captures the current on-disk state as a content-addressed pointer.
+//! * **Construct** (harvest): replay recorded (pre, post) snapshots into an
+//!   isolated per-agent change — `new_on` a recorded pre, overwrite the edited
+//!   files with their post content, snapshot to get a delta commit, then
+//!   `rebase`/`squash` it so jj's 3-way merge composes each agent's edits.
+//!
+//! Invariant: recorded snapshot commit ids stay diff-/rebase-able after `@` moves
+//! on (jj's store keeps them), which is what makes deferred construction work.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,7 +21,6 @@ pub struct Jj {
 pub struct Run {
     pub ok: bool,
     pub stdout: String,
-    pub stderr: String,
 }
 
 impl Jj {
@@ -30,31 +28,41 @@ impl Jj {
         Jj { root: root.to_path_buf() }
     }
 
+    pub fn root_path(&self) -> &Path {
+        &self.root
+    }
+
     /// Run `jj <args>` in the repo, never opening an editor or a pager.
     pub fn run(&self, args: &[&str]) -> Run {
         let out = Command::new("jj")
             .args(args)
             .current_dir(&self.root)
-            .env("JJ_EDITOR", "true") // never block on an interactive editor
+            .env("JJ_EDITOR", "true")
             .output();
         match out {
             Ok(o) => Run {
                 ok: o.status.success(),
                 stdout: String::from_utf8_lossy(&o.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&o.stderr).to_string(),
             },
-            Err(e) => Run { ok: false, stdout: String::new(), stderr: e.to_string() },
+            Err(_) => Run { ok: false, stdout: String::new() },
         }
     }
 
-    /// Snapshot the on-disk working copy into `@` (what `jj status` does as a
-    /// side effect). Used to materialize an edit before routing it.
-    pub fn snapshot(&self) -> Run {
-        self.run(&["status"])
+    // --- record --------------------------------------------------------------
+
+    /// Snapshot the working copy into `@` and return `@`'s commit id. `jj log`
+    /// snapshots as a side effect, so this both captures the current on-disk
+    /// state and yields the content-addressed pointer to it — in one call.
+    pub fn snapshot_commit(&self) -> Option<String> {
+        // Track first so `auto-track=none` doesn't hide newly-created files from
+        // the snapshot. (Untracked-but-existing files are made visible.)
+        let r = self.run(&["log", "-r", "@", "-T", "commit_id.short()", "--no-graph"]);
+        let id = r.stdout.trim().to_string();
+        (r.ok && !id.is_empty()).then_some(id)
     }
 
-    /// Track the given (existing) paths so `auto-track=none` repos still see
-    /// newly-created files. Missing paths (e.g. a deletion) are skipped.
+    /// Track the given (existing) paths, so `auto-track=none` repos still see
+    /// newly-created files in the next snapshot. Missing paths are skipped.
     pub fn file_track(&self, paths: &[String]) {
         let existing: Vec<&str> =
             paths.iter().filter(|p| self.root.join(p).exists()).map(|s| s.as_str()).collect();
@@ -66,87 +74,55 @@ impl Jj {
         let _ = self.run(&args);
     }
 
-    /// The change id at `rev` (short form), or None if it doesn't resolve.
+    // --- construct -----------------------------------------------------------
+
+    /// Check out `rev`'s content into a fresh working copy (`jj new <rev>`).
+    pub fn new_on(&self, rev: &str) -> Run {
+        self.run(&["new", rev])
+    }
+
+    /// Create a fresh empty child of `@` (moves `@` off whatever it was).
+    pub fn new_empty(&self) -> Run {
+        self.run(&["new"])
+    }
+
+    /// Snapshot the working copy (no output needed).
+    pub fn snapshot(&self) {
+        let _ = self.run(&["status"]);
+    }
+
+    /// The content of `path` at `rev`, or None if it doesn't exist there.
+    pub fn file_show(&self, rev: &str, path: &str) -> Option<String> {
+        let r = self.run(&["file", "show", "-r", rev, path]);
+        r.ok.then_some(r.stdout)
+    }
+
+    /// Rebase `change` (and only it) onto `dest`, letting jj's 3-way merge apply
+    /// its diff there. Conflicts (genuine same-region overlap) are recorded in
+    /// the result rather than merged away.
+    pub fn rebase_onto(&self, change: &str, dest: &str) -> Run {
+        self.run(&["rebase", "-r", change, "-d", dest])
+    }
+
+    /// Squash `from`'s changes down into `into`, keeping `into`'s description.
+    pub fn squash_into(&self, from: &str, into: &str) -> Run {
+        self.run(&["squash", "--from", from, "--into", into, "--use-destination-message"])
+    }
+
+    // --- queries -------------------------------------------------------------
+
     pub fn change_id(&self, rev: &str) -> Option<String> {
         let r = self.run(&["log", "-r", rev, "-T", "change_id.short()", "--no-graph"]);
         let id = r.stdout.trim().to_string();
         (r.ok && !id.is_empty()).then_some(id)
     }
 
-    pub fn exists(&self, rev: &str) -> bool {
-        self.change_id(rev).is_some()
-    }
-
-    /// Is `@` empty (no diff from its parent)?
-    pub fn working_is_empty(&self) -> bool {
-        let r = self.run(&["log", "-r", "@", "-T", r#"if(empty,"1","0")"#, "--no-graph"]);
+    pub fn is_conflict(&self, rev: &str) -> bool {
+        let r = self.run(&["log", "-r", rev, "-T", r#"if(conflict,"1","0")"#, "--no-graph"]);
         r.stdout.trim() == "1"
     }
 
-    /// Push a fresh empty child of `@` and check it out — used once to seal the
-    /// user's pre-existing work into the stack base.
-    pub fn new_empty_child(&self) -> Run {
-        self.run(&["new"])
+    pub fn describe(&self, rev: &str, message: &str) -> Run {
+        self.run(&["describe", "-r", rev, "-m", message])
     }
-
-    /// Insert an empty change as a direct child of `rev` (rebasing rev's existing
-    /// descendants on top), without moving `@`. Returns its change id. Used to
-    /// place the holding change just above the base, beneath the agent changes.
-    pub fn insert_after(&self, rev: &str, message: Option<&str>) -> Option<String> {
-        let mut args = vec!["new", "--no-edit", "--insert-after", rev];
-        if let Some(m) = message {
-            args.push("-m");
-            args.push(m);
-        }
-        let r = self.run(&args);
-        if !r.ok {
-            return None;
-        }
-        parse_created(&r.stdout, &r.stderr)
-    }
-
-    /// Mint an empty change directly beneath `@` *without* moving the working
-    /// copy, and return its stable change id. The new change becomes `@`'s
-    /// parent (`@-`). This is the `jj new`-like operation, minus relocating the
-    /// shared `@`.
-    pub fn mint_change(&self, message: Option<&str>) -> Option<String> {
-        let mut args = vec!["new", "--no-edit", "--insert-before", "@"];
-        if let Some(m) = message {
-            args.push("-m");
-            args.push(m);
-        }
-        let r = self.run(&args);
-        if !r.ok {
-            return None;
-        }
-        // The freshly inserted change is @'s parent; parse output as a fallback.
-        self.change_id("@-").or_else(|| parse_created(&r.stdout, &r.stderr))
-    }
-
-    /// Move only `paths`' portion of `@`'s diff down into `change`, keeping
-    /// `change`'s own description. Other files' changes stay in `@` — the
-    /// mechanism that lets a concurrent agent's edit remain unclaimed.
-    pub fn squash_paths_into(&self, change: &str, paths: &[String]) -> Run {
-        let mut args =
-            vec!["squash", "--from", "@", "--into", change, "--use-destination-message"];
-        let owned: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-        args.extend(owned);
-        self.run(&args)
-    }
-
-    pub fn describe(&self, change: &str, message: &str) -> Run {
-        self.run(&["describe", "-r", change, "-m", message])
-    }
-}
-
-/// Pull the change id out of a `jj new` line: "Created new commit <cid> <commit> …".
-fn parse_created(stdout: &str, stderr: &str) -> Option<String> {
-    for line in format!("{stdout}\n{stderr}").lines() {
-        if let Some(rest) = line.trim().strip_prefix("Created new commit ") {
-            if let Some(cid) = rest.split_whitespace().next() {
-                return Some(cid.to_string());
-            }
-        }
-    }
-    None
 }
