@@ -115,8 +115,13 @@ fn edited_paths(payload: &Value, to_rel: &dyn Fn(&str) -> Option<String>) -> Vec
 }
 
 fn session_start(payload: &Value) {
-    // Stamp JJ_COLLECT_AGENT=<session_id> into $CLAUDE_ENV_FILE so the agent's
-    // own `jj collect` call knows its identity. Respect an already-set value.
+    // Stamp JJ_EXTRACT_AGENT=<session_id> into $CLAUDE_ENV_FILE so the agent's own
+    // `jj extract` call knows its identity. Respect an already-set value.
+    //
+    // $CLAUDE_ENV_FILE is *sourced* as a shell prefix, so the line MUST say
+    // `export` — a bare `KEY=VALUE` sets an unexported shell var that never reaches
+    // the `jj-extract` subprocess `jj extract` spawns via `jj util exec`. (Even so,
+    // `from_cli` falls back to the always-exported $CLAUDE_CODE_SESSION_ID.)
     if std::env::var(ENV_VAR).map(|v| !v.is_empty()).unwrap_or(false) {
         return;
     }
@@ -130,7 +135,8 @@ fn session_start(payload: &Value) {
     };
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&env_file) {
-        let _ = writeln!(f, "{ENV_VAR}={sid}");
+        // Single-quote the value (session ids are UUIDs — no quotes to escape).
+        let _ = writeln!(f, "export {ENV_VAR}='{sid}'");
     }
 }
 

@@ -79,7 +79,7 @@ pub fn release(base: &Path, holder: &str) {
     }
 }
 
-/// RAII holder for single-process use (`jj collect`): acquires on construction,
+/// RAII holder for single-process use (`jj extract`): acquires on construction,
 /// releases on drop. The hooks instead acquire (Pre) and release (Post) across
 /// two processes, so they can't use this.
 pub struct Guard {
