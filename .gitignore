@@ -1,15 +1,6 @@
-# Python / uv
-.venv/
-__pycache__/
-*.py[cod]
-*.egg-info/
-build/
-dist/
+# Rust
+/target/
 
-# Tooling caches
-.ruff_cache/
-.mypy_cache/
-.pytest_cache/
-
-# commit-mychanges transient state (if init'd in this repo)
-.mychanges/
+# jj-collect writes state centrally under ~/.claude/jj-collect/, never in-repo,
+# but ignore a stray lock just in case.
+*.jj-collect-bak

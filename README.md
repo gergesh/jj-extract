@@ -1,135 +1,136 @@
-# commit-mychanges
+# jj-collect
 
-Multiple agents work in **one shared working directory**; this tool records
-which agent touched which file, so each agent can later harvest **its own**
-changes into a separate commit — `jj split` for Jujutsu, a
-`refs/mychanges/<agent>` commit for git.
+Multiple Claude Code agents work in **one shared jj working copy**. `jj-collect`
+routes each agent's edits into that agent's **own jj change**, so every agent's
+work ends up isolated in its own commit — automatically, at **line granularity**,
+while they type.
 
-It is a small CLI (`mychanges`) plus a Claude Code hook that does the recording.
-Register the hook once with `mychanges install` and recording is **automatic in
-every git/jj repo** — no per-repo setup. Attribution is stored centrally under
-`~/.claude/mychanges/`, so nothing is written into your repos.
+```
+base ─▶ change(agent-1) ─▶ change(agent-2) ─▶ @   (empty scratch)
+         └ only a1's edits   └ only a2's edits
+```
+
+It is a tiny CLI (`jj-collect`) plus a Claude Code hook. Because the binary is
+named `jj-collect`, jj also exposes it as a native subcommand — `jj collect …`.
+
+## Why not just track line numbers?
+
+Because line numbers lie. If agent 1 appends a line at the bottom of a file and
+agent 2 then inserts three lines at the top, agent 1's line has *moved* — any
+stored line numbers are now stale. Attribution has to be **content-based**, and
+splitting has to do real 3-way merges (especially for deletions, which leave no
+line to attribute).
+
+jj already does exactly this. So jj-collect does **no** line bookkeeping of its
+own. It hands each edit to jj as a change and lets jj's diff/rebase/squash engine
+do all the content math:
+
+- an agent's edits to disjoint regions **compose cleanly**, even as line numbers
+  shift underneath them;
+- a **deletion** is just content jj tracks — nothing special to record;
+- two agents editing the **same lines** is the one irreducible case, and jj
+  **surfaces it as a conflict** at harvest instead of silently letting the last
+  writer win.
 
 ## How it works
 
-```
-              ┌─ PostToolUse(Edit/Write/MultiEdit) ─ exact file paths, always
-hook (global) ┤
-              └─ Pre/PostToolUse(Bash) ── snapshot-diff of the tree, optional
-                          │
-                          ▼
-     ~/.claude/mychanges/<repo>-<hash>/attribution.db   (agent → files, SQLite/WAL)
-                          │
-        agent runs ──────►├─ mychanges mine     list my still-live changes
-                          ├─ mychanges list     numbered agents + overlaps
-                          └─ mychanges commit    jj split / git per-agent commit
-```
+On every `Edit`/`Write`/`MultiEdit`, a `PostToolUse` hook:
 
-**Tiered attribution.** `Edit`/`Write`/`MultiEdit` carry the exact file path in
-the hook payload, so those are attributed precisely and always. `Bash` can
-change files in arbitrary ways (`sed -i`, codegen, `mv`), so it's handled by an
-**optional** before/after snapshot-diff of the working tree — off by default
-because it walks the tree on every Bash call.
+1. `jj file track`s the edited paths (needed when `snapshot.auto-track=none`);
+2. snapshots the working copy into `@`;
+3. **squashes only that edit's files** out of `@` and down into the acting
+   agent's change (creating it, inserted just beneath `@`, the first time).
 
-**Identity.** Each agent is identified by its Claude Code `session_id` (distinct
-per top-level `claude` process). A `SessionStart` hook stamps
-`MYCHANGES_AGENT=<session_id>` into `$CLAUDE_ENV_FILE` so the agent's own CLI
-calls know who they are. To name agents yourself, export `MYCHANGES_AGENT`
-before launching `claude` — it's respected end to end.
+Step 3 is the whole trick. `jj squash --from @ --into <agent> -- <paths>` moves
+*only the agent's own files*, so a peer's simultaneous edit to a **different**
+file stays sitting in `@`, untouched, until that peer's own hook claims it.
+
+### Races are handled
+
+Every repo mutation runs while holding an exclusive `flock`, so concurrent agent
+hooks serialize instead of corrupting the shared working copy. Combined with the
+path-scoped squash above:
+
+- **different files, any timing** → each agent gets exactly its own file;
+- **sequential edits to the same file** → split cleanly by content (line shifts
+  and all);
+- **truly simultaneous writes to the same file** → the bytes are already merged
+  on disk, so that one file goes to whichever hook wins the lock first
+  (best-effort, and inherent — you cannot un-merge bytes written at the same
+  instant).
+
+A `PreToolUse` hook fires once before the first edit to seal whatever the user
+already had into the stack **base**, so pre-existing work is never attributed to
+an agent.
+
+### Identity
+
+Each agent is its Claude Code `session_id` (distinct per top-level `claude`
+process). A `SessionStart` hook stamps `JJ_COLLECT_AGENT=<session_id>` into
+`$CLAUDE_ENV_FILE` so the agent's own CLI calls know who they are. Export
+`JJ_COLLECT_AGENT` yourself to name agents.
+
+State (which jj change collects each agent — jj change ids are stable across the
+rebases/squashes involved) lives centrally under `~/.claude/jj-collect/`, never
+in your repo. `JJ_COLLECT_HOME` relocates it.
 
 ## Install
 
 ```bash
-uv tool install /path/to/commit-mychanges      # puts `mychanges` on PATH
-# or, for development from this repo:
-uv run mychanges --help
-```
-
-## Set up once
-
-```bash
-mychanges install            # register hooks in ~/.claude/settings.json (every repo)
-mychanges install --project  # or just this repo's .claude/settings.json
-mychanges uninstall          # remove them again (leaves your other hooks intact)
+cargo install --path .          # puts `jj-collect` on PATH
+jj-collect install              # register the hooks in ~/.claude/settings.json
+jj-collect install --project    # …or just this repo's .claude/settings.json
+jj-collect uninstall            # remove them again (leaves other hooks intact)
 ```
 
 `install` merges into your existing settings (preserving every other key and
-hook) and writes a `*.mychanges-bak` backup first. After this, recording is
-automatic in every git/jj repo — the hook is inert outside a repo and writes
-data centrally, never into the working tree.
-
-`mychanges init` is **optional** now: use it only to turn on Bash attribution
-for a repo (`mychanges init --bash`) or pre-create its store. To enable Bash
-attribution everywhere, put `[attribution]\nbash = true` in
-`~/.claude/mychanges/config.toml`.
+hook) and writes a `*.jj-collect-bak` backup first. After that, collection is
+automatic in every jj repo.
 
 ## Use
 
-Just edit, in any repo. To inspect or harvest changes — including when *you* run
-the tool and don't know the agent ids:
+Just edit, with multiple agents, in one jj repo. Then:
 
 ```bash
-mychanges list                       # numbered agents + their changes (+ overlaps)
-mychanges mine                       # files I (this session) changed, still live
-mychanges commit --agent 1 -m "..."  # harvest agent [1] from `list` (or a name prefix)
-mychanges commit -m "add parser"     # harvest my own changes
-mychanges commit -m "..." --dry-run  # show the exact jj/git commands first
+jj collect list                       # the stack: each agent + its change + files
+jj collect mine                       # the change I (this session) am collecting
+jj collect commit --agent 1 -m "..."  # harvest agent [1] onto base as its own commit
+jj collect commit -m "add parser"     # harvest my own change
 ```
 
-`list` numbers every agent so you never need the raw id — pass the number (or a
-unique name prefix) to `--agent` on `mine`/`commit`. `mychanges list --repos`
-shows all repos that have recordings.
-
-- **jj:** `commit` runs `jj file track <my paths>` (needed when
-  `snapshot.auto-track` is off) then `jj split -m <msg> <my paths>`, peeling your
-  files into their own commit and leaving everyone else's changes in `@`. Run
-  agents' commits one after another to stack them.
-- **git:** `commit` builds a temporary index from `HEAD`, stages only your
-  paths, and writes a commit to `refs/mychanges/<agent>` **without** moving
-  `HEAD` or touching the working tree. Inspect with `git show <ref>`; then
-  cherry-pick / branch / merge as you like. (The tool sets `JJ_GIT_OK=1` on its
-  own git calls to pass a `git`-in-jj guard if you run one.)
-
-## The one caveat
-
-If two agents edit **overlapping regions of the same file**, the file on disk
-holds only the final bytes — there is no way to split that into two independent
-commits. This tool works at **file granularity**: `list`/`mine` flag any file
-touched by more than one agent, and `commit` takes the current on-disk content
-(last writer wins) for shared files. Partition work across agents to avoid this.
-
-Bash attribution is **best-effort**: within one agent its tool calls are
-sequential so its before/after window is clean, but concurrent agents' windows
-overlap, so a file changed by a Bash command may be attributed to whichever
-agent's window saw it.
-
-## Config
-
-A repo's config lives at `~/.claude/mychanges/<repo>-<hash>/config.toml`, with a
-global fallback at `~/.claude/mychanges/config.toml`:
-
-```toml
-[attribution]
-bash = false          # attribute Bash-changed files via snapshot-diff
-ignore = [ "**/node_modules/**", "**/.venv/**", ... ]   # skipped during Bash scans
-```
-
-Toggling `bash` takes effect immediately. Set `MYCHANGES_HOME` to relocate the
-central store.
+`list` numbers every agent, so you pass the number (or a unique name prefix) to
+`--agent`. `commit` lifts the agent's collected change onto the stack base with
+`jj duplicate`, re-applying it via 3-way merge; if it genuinely overlaps another
+agent's edits, the harvested commit is created **with conflict markers** and the
+command says so — rather than quietly dropping someone's work. Pass `--in-place`
+to just name the in-stack change without lifting a copy onto base.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `mychanges install [--global/--project]` | Register the hooks in Claude settings (run once) |
-| `mychanges uninstall [--global/--project]` | Remove the hooks (leaves other hooks intact) |
-| `mychanges init [--bash] [--force]` | Optional: enable Bash attribution for this repo / pre-create its store |
-| `mychanges list [--repos] [--json]` | Numbered agents + their changes (or, with `--repos`, all repos) |
-| `mychanges mine [--agent A] [--json] [--paths]` | My still-live changed files |
-| `mychanges commit -m MSG [--agent A] [--dry-run] [--keep]` | Harvest an agent's changes into a commit (`A` = id, index, or prefix) |
-| `mychanges reset [--agent A] [--all]` | Forget attribution records (never touches files/commits) |
-| `mychanges where` | Print the central data dir for the current repo |
-| `mychanges hook` | Hook entry point (used in settings.json; not for manual use) |
+| `jj-collect install [--project]` | Register the hooks in Claude settings (run once) |
+| `jj-collect uninstall [--project]` | Remove the hooks (leaves other hooks intact) |
+| `jj-collect list [--json]` | The collect stack: agents, their changes, files |
+| `jj-collect mine [--agent A]` | The change I'm collecting |
+| `jj-collect commit -m MSG [--agent A] [--in-place]` | Harvest an agent's change (`A` = id, index, or prefix) |
+| `jj-collect reset [--agent A] [--all]` | Forget collection state (never touches your changes) |
+| `jj-collect where` | Print the central data dir for the current repo |
+| `jj-collect hook` | Hook entry point (used in settings.json; not for manual use) |
 
-Attribution data lives entirely under `~/.claude/mychanges/` — nothing is
-written into your repositories.
+## Scope
+
+jj-native, by design (`git` is intentionally not a target). Attribution is for
+the file-editing tools (`Edit`/`Write`/`MultiEdit`); files changed by arbitrary
+`Bash` commands are not attributed.
+
+## Test
+
+```bash
+cargo build
+tests/integration.sh          # drives the real binary via synthetic hook JSON
+```
+
+The suite covers sequential same-file line-shift splitting, concurrent
+different-file races (including truly parallel hook processes), same-line
+conflict surfacing, and new-file creation under `auto-track=none`.

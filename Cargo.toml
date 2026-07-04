@@ -1,0 +1,22 @@
+[package]
+name = "jj-collect"
+version = "0.1.0"
+edition = "2021"
+description = "Per-agent change attribution for a shared jj working copy: each agent's edits auto-collect into their own jj change."
+license = "MIT"
+
+# Binary named `jj-collect` so `jj collect …` invokes it as a native jj subcommand.
+[[bin]]
+name = "jj-collect"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+fs2 = "0.4"
+dirs = "5"
+
+[profile.release]
+strip = true
+lto = true
