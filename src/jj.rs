@@ -146,6 +146,11 @@ impl Jj {
         self.run(&["edit", rev])
     }
 
+    /// Abandon `rev` (used to clean up the builder's throwaway pre-image commits).
+    pub fn abandon(&self, rev: &str) -> Run {
+        self.run(&["abandon", "-r", rev])
+    }
+
     // --- queries -------------------------------------------------------------
 
     pub fn change_id(&self, rev: &str) -> Option<String> {

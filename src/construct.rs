@@ -29,6 +29,13 @@ pub fn agents_in(evolog: &[Evolution]) -> Vec<String> {
 }
 
 /// Build one agent's change from the evolog (chronological), rebased onto `base`.
+///
+/// The recorded evolutions all share `@`'s change id, so we must never make one a
+/// graph commit (that would fork `@` into divergent versions). Instead, for each
+/// evolution we build the delta on **fresh throwaway commits** whose *content* is
+/// restored from `pre`/`post` — a pre-image commit, then a child holding `post`'s
+/// content, so its diff-vs-parent is exactly `diff(pre, post)`. We rebase that
+/// delta onto the accumulator and abandon the pre-image.
 pub fn build_one(
     jj: &Jj,
     base: &str,
@@ -37,6 +44,7 @@ pub fn build_one(
     message: Option<&str>,
 ) -> Option<Built> {
     let mut acc: Option<String> = None; // the agent's accumulating change id
+    let mut scaffolds: Vec<String> = vec![]; // throwaway pre-image commits to abandon
 
     for i in 1..evolog.len() {
         if evolog[i].user != session {
@@ -45,18 +53,26 @@ pub fn build_one(
         let pre = &evolog[i - 1].commit;
         let post = &evolog[i].commit;
 
-        // A delta commit whose diff-vs-parent is exactly diff(pre, post): put `@`
-        // on `pre`, restore it to `post`'s tree, snapshot.
-        if !jj.new_on(pre).ok {
+        // Fresh pre-image commit on base, with pre's *content* (restore, not
+        // resurrect the evolution).
+        if !jj.new_on(base).ok {
             continue;
         }
+        jj.restore_from(pre);
+        jj.snapshot();
+        let preimg = match jj.change_id("@") {
+            Some(c) => c,
+            None => continue,
+        };
+        // Fresh child holding post's content → its diff vs the pre-image is
+        // exactly diff(pre, post): this agent's edit for that step.
+        jj.new_empty();
         jj.restore_from(post);
         jj.snapshot();
         let delta = match jj.change_id("@") {
             Some(d) => d,
             None => continue,
         };
-        jj.new_empty(); // move @ off the delta so the rebase is clean
 
         match &acc {
             None => {
@@ -68,9 +84,13 @@ pub fn build_one(
                 jj.squash_into(&delta, c);
             }
         }
+        scaffolds.push(preimg);
     }
 
     let change = acc?;
+    for s in &scaffolds {
+        jj.abandon(s); // childless now (their deltas were rebased away)
+    }
     let desc = message.map(|m| m.to_string()).unwrap_or_else(|| format!("jj-extract: {session}"));
     jj.describe(&change, &desc);
     let conflict = jj.is_conflict(&change);
