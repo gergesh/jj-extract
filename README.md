@@ -1,128 +1,115 @@
 # jj-collect
 
-Multiple Claude Code agents work in **one shared jj working copy**. `jj-collect`
-routes each agent's edits into that agent's **own jj change**, so every agent's
-work ends up isolated in its own commit — automatically, at **line granularity**,
-while they type.
+Multiple Claude Code agents share **one** jj working copy. Each agent runs one
+command — **`jj collect`** — and from then on its edits are automatically
+collected into its own jj change. Every agent's work ends up isolated in its own
+commit, at **line granularity**, with jj's own diff/rebase engine doing all the
+content math.
 
 ```
-base ─▶ change(agent-1) ─▶ change(agent-2) ─▶ @   (empty scratch)
-         └ only a1's edits   └ only a2's edits
+base ─▶ holding ─▶ change(agent-1) ─▶ change(agent-2) ─▶ @   (shared scratch)
+ │         │            │                   │
+ │         │            └ only a1's edits   └ only a2's edits
+ │         └ non-tool ("foreign") edits, unattributed
+ └ the user's pre-existing work, sealed
 ```
 
-It is a tiny CLI (`jj-collect`) plus a Claude Code hook. Because the binary is
-named `jj-collect`, jj also exposes it as a native subcommand — `jj collect …`.
+It's one command plus a Claude Code hook. Installed as `jj-collect`, it's also
+reachable as the native jj subcommand `jj collect …`.
 
-## Why not just track line numbers?
+## The one command agents use
+
+```bash
+jj collect -m "what I'm about to do"    # like `jj new`: opens my change; edits collect into it
+jj collect --to <rev>                   # collect into an existing change instead of a new one
+```
+
+Run it **once**, before editing. After that, just edit — a `PostToolUse` hook
+squashes each edit into your change. That's the entire workflow; there is no
+`list`/`mine`/`commit`/`harvest` — your change simply *is* your collected work,
+already separated in the repo.
+
+## Why not track line numbers?
 
 Because line numbers lie. If agent 1 appends a line at the bottom of a file and
-agent 2 then inserts three lines at the top, agent 1's line has *moved* — any
-stored line numbers are now stale. Attribution has to be **content-based**, and
-splitting has to do real 3-way merges (especially for deletions, which leave no
-line to attribute).
-
-jj already does exactly this. So jj-collect does **no** line bookkeeping of its
-own. It hands each edit to jj as a change and lets jj's diff/rebase/squash engine
-do all the content math:
-
-- an agent's edits to disjoint regions **compose cleanly**, even as line numbers
-  shift underneath them;
-- a **deletion** is just content jj tracks — nothing special to record;
-- two agents editing the **same lines** is the one irreducible case, and jj
-  **surfaces it as a conflict** at harvest instead of silently letting the last
-  writer win.
+agent 2 then inserts three lines at the top, agent 1's line has moved — any
+stored line numbers are stale. So jj-collect does **no** line bookkeeping: it
+hands each edit to jj as a change and lets jj compose them. Disjoint edits merge
+cleanly even as lines shift; deletions are just content; two agents editing the
+same lines is the one irreducible case.
 
 ## How it works
 
-On every `Edit`/`Write`/`MultiEdit`, a `PostToolUse` hook:
+Each edit is **bracketed** by two hooks, for a session that has opted in via
+`jj collect`:
 
-1. `jj file track`s the edited paths (needed when `snapshot.auto-track=none`);
-2. snapshots the working copy into `@`;
-3. **squashes only that edit's files** out of `@` and down into the acting
-   agent's change (creating it, inserted just beneath `@`, the first time).
+- **PreToolUse** parks the about-to-be-edited files' *current* `@` content into a
+  neutral **holding change** — so `@` is clean for them.
+- **PostToolUse** squashes what's now in `@` for those files (which is *only*
+  this tool use) down into the agent's change.
 
-Step 3 is the whole trick. `jj squash --from @ --into <agent> -- <paths>` moves
-*only the agent's own files*, so a peer's simultaneous edit to a **different**
-file stays sitting in `@`, untouched, until that peer's own hook claims it.
+The bracket is what makes a collected change contain **only** the agent's own
+tool edits: anything else that touched the same file — a `jj`/Bash side-effect,
+the human, another agent — was parked into the holding change and never leaks in.
+
+Both hooks are **path-scoped** (`jj squash … -- <paths>`): they touch only the
+files of the edit at hand, leaving a concurrent agent's other files alone.
 
 ### Races are handled
 
-Every repo mutation runs while holding an exclusive `flock`, so concurrent agent
-hooks serialize instead of corrupting the shared working copy. Combined with the
-path-scoped squash above:
+Every repo mutation (collect, and both hooks) runs while holding an exclusive
+`flock`, so concurrent agents serialize instead of corrupting the shared working
+copy. Combined with path-scoped squashes:
 
 - **different files, any timing** → each agent gets exactly its own file;
 - **sequential edits to the same file** → split cleanly by content (line shifts
   and all);
 - **truly simultaneous writes to the same file** → the bytes are already merged
   on disk, so that one file goes to whichever hook wins the lock first
-  (best-effort, and inherent — you cannot un-merge bytes written at the same
-  instant).
+  (best-effort, and inherent).
 
-A `PreToolUse` hook fires once before the first edit to seal whatever the user
-already had into the stack **base**, so pre-existing work is never attributed to
-an agent.
+`jj collect` never *moves* the shared `@` (it inserts your change beneath it), so
+a peer's not-yet-squashed edit is never absorbed into the wrong change.
 
 ### Identity
 
-Each agent is its Claude Code `session_id` (distinct per top-level `claude`
-process). A `SessionStart` hook stamps `JJ_COLLECT_AGENT=<session_id>` into
-`$CLAUDE_ENV_FILE` so the agent's own CLI calls know who they are. Export
-`JJ_COLLECT_AGENT` yourself to name agents.
+Each agent is its Claude Code `session_id`. A `SessionStart` hook stamps
+`JJ_COLLECT_AGENT=<session_id>` into `$CLAUDE_ENV_FILE`, so the `jj collect` you
+run knows which session it is. Export `JJ_COLLECT_AGENT` yourself to name agents.
 
-State (which jj change collects each agent — jj change ids are stable across the
-rebases/squashes involved) lives centrally under `~/.claude/jj-collect/`, never
-in your repo. `JJ_COLLECT_HOME` relocates it.
+State (which change each session collects into; jj change ids are stable across
+the squashes involved) lives centrally under `~/.claude/jj-collect/`, never in
+your repo. `JJ_COLLECT_HOME` relocates it.
 
 ## Install
 
 ```bash
-cargo install --path .          # puts `jj-collect` on PATH
-jj-collect install              # register the hooks in ~/.claude/settings.json
-jj-collect install --project    # …or just this repo's .claude/settings.json
-jj-collect uninstall            # remove them again (leaves other hooks intact)
+cargo install --path .        # puts `jj-collect` on PATH
+jj-collect --install          # register the hooks + the `jj collect` alias (global)
+jj-collect --install --project  # …or just this repo's .claude/settings.json
+jj-collect --uninstall        # remove them again (leaves other hooks intact)
 ```
 
-`install` merges into your existing settings (preserving every other key and
-hook) and writes a `*.jj-collect-bak` backup first. After that, collection is
-automatic in every jj repo.
+`--install` merges into your Claude settings (preserving every other key and
+hook, with a `*.jj-collect-bak` backup) and registers `jj collect` as a jj user
+alias via `jj util exec`. A **skill** at `.claude/skills/jj-collect/` tells agents
+to run `jj collect` at the start of a task; copy it where your agents run.
 
-## Use
+## CLI
 
-Just edit, with multiple agents, in one jj repo. Then:
-
-```bash
-jj collect list                       # the stack: each agent + its change + files
-jj collect mine                       # the change I (this session) am collecting
-jj collect commit --agent 1 -m "..."  # harvest agent [1] onto base as its own commit
-jj collect commit -m "add parser"     # harvest my own change
-```
-
-`list` numbers every agent, so you pass the number (or a unique name prefix) to
-`--agent`. `commit` lifts the agent's collected change onto the stack base with
-`jj duplicate`, re-applying it via 3-way merge; if it genuinely overlaps another
-agent's edits, the harvested commit is created **with conflict markers** and the
-command says so — rather than quietly dropping someone's work. Pass `--in-place`
-to just name the in-stack change without lifting a copy onto base.
-
-## Commands
-
-| Command | What it does |
+| Invocation | What it does |
 |---|---|
-| `jj-collect install [--project]` | Register the hooks in Claude settings (run once) |
-| `jj-collect uninstall [--project]` | Remove the hooks (leaves other hooks intact) |
-| `jj-collect list [--json]` | The collect stack: agents, their changes, files |
-| `jj-collect mine [--agent A]` | The change I'm collecting |
-| `jj-collect commit -m MSG [--agent A] [--in-place]` | Harvest an agent's change (`A` = id, index, or prefix) |
-| `jj-collect reset [--agent A] [--all]` | Forget collection state (never touches your changes) |
-| `jj-collect where` | Print the central data dir for the current repo |
-| `jj-collect hook` | Hook entry point (used in settings.json; not for manual use) |
+| `jj collect [-m MSG]` | Open a change and collect this session's edits into it |
+| `jj collect --to <rev>` | Collect into an existing change instead |
+| `jj-collect --install [--project]` | Register the hooks + `jj collect` alias |
+| `jj-collect --uninstall [--project]` | Remove them |
+| `jj-collect --hook` | Hook entry point (used in settings.json; not for manual use) |
 
 ## Scope
 
-jj-native, by design (`git` is intentionally not a target). Attribution is for
-the file-editing tools (`Edit`/`Write`/`MultiEdit`); files changed by arbitrary
-`Bash` commands are not attributed.
+jj-native, by design (`git` is intentionally not a target). Only the file-editing
+tools (`Edit`/`Write`/`MultiEdit`) are collected; files changed by arbitrary
+`Bash` commands are treated as non-tool content and land in the holding change.
 
 ## Test
 
@@ -131,6 +118,7 @@ cargo build
 tests/integration.sh          # drives the real binary via synthetic hook JSON
 ```
 
-The suite covers sequential same-file line-shift splitting, concurrent
-different-file races (including truly parallel hook processes), same-line
-conflict surfacing, and new-file creation under `auto-track=none`.
+Covers sequential same-file line-shift splitting, concurrent different-file races
+(including truly parallel hook processes), non-tool-change isolation via the
+holding change, opt-in (an uncollected session is left alone), and new-file
+creation under `auto-track=none`.

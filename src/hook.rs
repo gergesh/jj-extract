@@ -1,5 +1,6 @@
-//! Claude Code hook entry point. Reads the hook JSON on stdin and routes each
-//! agent's edit into that agent's collecting jj change.
+//! Claude Code hook entry point (`jj-collect --hook`). Reads the hook JSON on
+//! stdin and, for a session that has opted in via `jj collect`, squashes that
+//! session's edit into its bound change.
 //!
 //! Contract: this must NEVER interfere with the tool call. It always exits 0,
 //! emits nothing on stdout, and swallows every error (logged best-effort).
@@ -44,21 +45,25 @@ fn dispatch(payload: &Value) {
         session_start(payload);
         return;
     }
+    if event != "PreToolUse" && event != "PostToolUse" {
+        return;
+    }
+    let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");
+    if !FILE_TOOLS.contains(&tool) {
+        return;
+    }
 
     let cwd = payload
         .get("cwd")
         .and_then(Value::as_str)
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default());
-    // Recording is jj-native: nothing to do outside a jj working copy.
+    // Collection is jj-native: nothing to do outside a jj working copy.
     let root = match find_repo_root(Path::new(&cwd)) {
         Some(r) => r,
         None => return,
     };
-    let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");
-    if !FILE_TOOLS.contains(&tool) {
-        return;
-    }
+    let agent = from_payload(payload.get("session_id").and_then(Value::as_str));
 
     let base_dir = match ensure_data_dir(&root) {
         Ok(b) => b,
@@ -74,91 +79,56 @@ fn dispatch(payload: &Value) {
             return;
         }
     };
-    let jj = Jj::new(&root);
-
-    match event {
-        // Before the first edit lands, seal whatever the user already had into
-        // the stack base so it is never attributed to an agent.
-        "PreToolUse" => {
-            let mut state = State::load(&base_dir);
-            ensure_base(&jj, &mut state, &base_dir, true);
-        }
-        "PostToolUse" => {
-            let mut state = State::load(&base_dir);
-            route_edit(payload, &jj, &mut state, &base_dir);
-        }
-        _ => {}
-    }
-}
-
-/// Establish the stack floor once. Agents insert their changes *beneath* `@`, so
-/// the floor is `@`'s parent. With `seal` (the PreToolUse path), `@` holds the
-/// user's pre-existing work — we push it into a fresh commit so it becomes the
-/// floor and agents build on an empty `@`. Without `seal` (the rare PostToolUse
-/// fallback when PreToolUse didn't run), `@` already holds the edit; we just
-/// anchor the floor at `@-` and let routing claim the edit for its agent.
-fn ensure_base(jj: &Jj, state: &mut State, base_dir: &Path, seal: bool) {
-    if state.base.is_some() {
+    let mut state = State::load(&base_dir);
+    // Opt-in: only sessions that ran `jj collect` have a bound change.
+    if !state.bindings.contains_key(&agent) {
         return;
     }
-    jj.snapshot();
-    if seal && !jj.working_is_empty() {
-        if !jj.new_empty_child().ok {
-            return;
-        }
-    }
-    let base = match jj.change_id("@-") {
-        Some(b) => b,
-        None => return,
-    };
-    state.base = Some(base);
-    if let Err(e) = state.save(base_dir) {
-        log_error(&format!("save base: {e}"));
-    }
-}
-
-fn route_edit(payload: &Value, jj: &Jj, state: &mut State, base_dir: &Path) {
-    // Fallback: if PreToolUse never ran, anchor the floor at @- without sealing
-    // so this edit stays in @ and gets claimed for its agent below.
-    if state.base.is_none() {
-        ensure_base(jj, state, base_dir, false);
-    }
-
-    let session_id = payload.get("session_id").and_then(Value::as_str);
-    let agent = from_payload(session_id);
-
-    let root_rel = |p: &str| relpath_within(p, jj.root_path());
-    let paths = edited_paths(payload, &root_rel);
+    let jj = Jj::new(&root);
+    let paths = edited_paths(payload, &|p| relpath_within(p, &root));
     if paths.is_empty() {
         return;
     }
 
-    // auto-track=none: make sure freshly-created files are visible to snapshots.
-    jj.file_track(&paths);
-    jj.snapshot();
+    if event == "PreToolUse" {
+        pre_tool(&jj, &mut state, &base_dir, &paths);
+    } else {
+        post_tool(&jj, &state, &agent, &paths);
+    }
+}
 
-    // Find (or create) this agent's collecting change. Recreate if a stored id
-    // no longer resolves (e.g. the user abandoned it).
-    let change = match state.agents.get(&agent) {
-        Some(rec) if jj.exists(&rec.change_id) => rec.change_id.clone(),
-        _ => match jj.insert_agent_change(&agent) {
-            Some(c) => c,
-            None => {
-                log_error("insert_agent_change failed");
-                return;
-            }
-        },
+/// Before the tool runs, park the target files' *current* `@` content into the
+/// holding change, so `@` is clean for them. Whatever the tool then writes is
+/// the only delta on those files at PostToolUse — nothing pre-existing (a Bash
+/// command, the human, a peer) leaks into the agent's collected change.
+fn pre_tool(jj: &Jj, state: &mut State, base_dir: &Path, paths: &[String]) {
+    let holding = match crate::stack::ensure_holding(jj, state, base_dir) {
+        Some(h) => h,
+        None => return,
     };
+    jj.file_track(paths);
+    jj.snapshot();
+    // Path-scoped: only the about-to-be-edited files move; a peer's other file
+    // stays in `@`. A no-op (files already clean) is fine and ignored.
+    let _ = jj.squash_paths_into(&holding, paths);
+}
 
-    let r = jj.squash_paths_into(&change, &paths);
-    if !r.ok {
-        log_error(&format!("squash into {change} failed: {}", r.stderr.trim()));
+/// After the tool runs, squash the (now isolated) delta on the target files into
+/// the session's bound change.
+fn post_tool(jj: &Jj, state: &State, agent: &str, paths: &[String]) {
+    let change = match state.bindings.get(agent) {
+        Some(c) => c.clone(),
+        None => return,
+    };
+    if !jj.exists(&change) {
+        // The bound change was abandoned; leave the edit in @ rather than guess.
         return;
     }
-
-    state.touch(&agent, &change, &paths);
-    if let Err(e) = state.save(base_dir) {
-        log_error(&format!("save state: {e}"));
+    jj.file_track(paths);
+    jj.snapshot();
+    let r = jj.squash_paths_into(&change, paths);
+    if !r.ok {
+        log_error(&format!("squash into {change} failed: {}", r.stderr.trim()));
     }
 }
 
@@ -192,7 +162,7 @@ fn edited_paths(payload: &Value, to_rel: &dyn Fn(&str) -> Option<String>) -> Vec
 
 fn session_start(payload: &Value) {
     // Stamp JJ_COLLECT_AGENT=<session_id> into $CLAUDE_ENV_FILE so the agent's
-    // own CLI calls know their identity. Respect an already-set value.
+    // own `jj collect` call knows its identity. Respect an already-set value.
     if std::env::var(ENV_VAR).map(|v| !v.is_empty()).unwrap_or(false) {
         return;
     }

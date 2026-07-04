@@ -4,8 +4,9 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
-/// The three hook registrations jj-collect needs:
-/// SessionStart (stamp identity), and Pre/PostToolUse for the file-editing tools.
+/// The hook registrations jj-collect needs: SessionStart (stamp identity), and
+/// Pre/PostToolUse for the file-editing tools. PreToolUse parks pre-existing
+/// content so PostToolUse collects only the tool use's own delta.
 const REGISTRATIONS: [(&str, Option<&str>); 3] = [
     ("SessionStart", None),
     ("PreToolUse", Some("Edit|Write|MultiEdit")),
