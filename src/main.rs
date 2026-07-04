@@ -27,7 +27,7 @@ use std::process::exit;
 
 use identity::{from_cli, ENV_VAR};
 use jj::Jj;
-use paths::{ensure_data_dir, find_repo_root};
+use paths::find_repo_root;
 
 #[derive(Parser)]
 #[command(
@@ -84,17 +84,11 @@ fn cmd_extract(message: Option<String>, agent_opt: Option<String>, all: bool) ->
             return 2;
         }
     };
-    let base_dir = match ensure_data_dir(&root) {
-        Ok(b) => b,
-        Err(e) => {
-            err(&format!("data dir: {e}"));
-            return 1;
-        }
-    };
     let jj = Jj::new(&root);
-    // Hold the edit lock while we read the evolog and construct: it stops a
-    // concurrent hook from snapshotting `@` into the build's intermediate states.
-    let _guard = lock::Guard::new(&base_dir, "extract");
+    // Hold the edit lock (in the repo's `.jj/`) while we read the evolog and
+    // construct: it stops a concurrent hook from snapshotting `@` into the
+    // build's intermediate states.
+    let _guard = lock::Guard::new(&root.join(".jj"), "extract");
 
     let evolog = jj.evolog();
     // The extracted change branches from `@`'s parent — the commit the working

@@ -29,7 +29,7 @@ fn now() -> u64 {
 }
 
 fn lock_path(base: &Path) -> PathBuf {
-    base.join("edit.lock")
+    base.join("jj-extract.lock")
 }
 
 /// Take the edit lock for `holder`, stealing a stale holder and — to never wedge

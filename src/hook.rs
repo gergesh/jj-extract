@@ -21,7 +21,7 @@ use std::path::Path;
 
 use crate::identity::{from_payload, ENV_VAR};
 use crate::jj::Jj;
-use crate::paths::{central_root, ensure_data_dir, find_repo_root, relpath_within};
+use crate::paths::{central_root, find_repo_root, relpath_within};
 
 const FILE_TOOLS: [&str; 3] = ["Edit", "Write", "MultiEdit"];
 
@@ -67,20 +67,15 @@ fn dispatch(payload: &Value) {
     };
     let agent = from_payload(payload.get("session_id").and_then(Value::as_str));
 
-    let base_dir = match ensure_data_dir(&root) {
-        Ok(b) => b,
-        Err(e) => {
-            log_error(&format!("ensure_data_dir: {e}"));
-            return;
-        }
-    };
+    // The lock lives in the repo's own `.jj/` — no central data dir needed.
+    let lock_dir = root.join(".jj");
     let jj = Jj::new(&root);
 
     if event == "PreToolUse" {
         // Hold the edit lock across the write (released at PostToolUse) so no peer
         // writes meanwhile. The neutral snapshot flushes anything already on disk
         // (a Bash/human change) to an unattributed evolution.
-        crate::lock::acquire(&base_dir, &agent);
+        crate::lock::acquire(&lock_dir, &agent);
         jj.snapshot_neutral();
         return;
     }
@@ -88,7 +83,7 @@ fn dispatch(payload: &Value) {
     // PostToolUse: capture the edit as this agent's evolution, then release.
     let files = edited_paths(payload, &|p| relpath_within(p, &root));
     jj.snapshot_tagged(&agent, &files);
-    crate::lock::release(&base_dir, &agent);
+    crate::lock::release(&lock_dir, &agent);
 }
 
 /// Extract repo-relative edited paths from a tool payload (Edit/Write/MultiEdit).
