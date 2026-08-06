@@ -1,11 +1,12 @@
 ---
 name: jj-extract
 description: >-
-  Use in a jj repository shared by multiple Claude agents where `jj-extract` is
-  installed. Your edits are recorded automatically; run `jj extract` to pull just
-  your session's edits into their own jj change, separate from other agents'.
-  Triggers when finishing a chunk of work in a shared/multi-agent jj working copy,
-  or when you see a `jj-extract` hook in settings.
+  Use in a jj repository shared by multiple Claude Code or Codex agents where
+  `jj-extract` is installed. Your edits are recorded automatically; run
+  `jj extract` to pull just your session's edits into their own jj change,
+  separate from other agents'. Triggers when finishing a chunk of work in a
+  shared/multi-agent jj working copy, or when you see a `jj-extract` hook in an
+  agent's hook config.
 ---
 
 # jj-extract
@@ -19,7 +20,9 @@ jj extract -m "<short description of what you did>"
 ```
 
 That reconstructs a jj change containing **only your** edits — down to the line,
-separate from everyone else's — and prints its id.
+separate from everyone else's — and prints its id. Extracted session changes are
+kept in first-edit order as a linear stack below the live working copy, so the
+command does not leave a sibling branch per agent.
 
 ## Why
 
@@ -33,6 +36,8 @@ also edited (that lands unattributed, not in your change).
 
 - Nothing to do up front — just edit; recording is automatic.
 - `jj extract` is safe to run alongside other agents.
+- The live working-copy change and file contents are preserved; attributed edits
+  move into the extraction stack and unattributed edits remain in live `@`.
 - `jj extract --all` builds a change for every session (for whoever is collecting
   everyone's work).
 - If `jj-extract` isn't installed (no `jj extract` command), ignore this and work

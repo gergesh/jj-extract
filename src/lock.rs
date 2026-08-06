@@ -33,7 +33,10 @@ const STALE_SECS: u64 = 10;
 const MAX_WAIT_MS: u64 = 12_000;
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn lock_path(base: &Path) -> PathBuf {
@@ -51,7 +54,12 @@ pub fn acquire(base: &Path, holder: &str) {
     let tmp = base.join(format!("jj-extract.{}.tmp", std::process::id()));
     let mut waited = 0u64;
     loop {
-        if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp) {
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+        {
             let _ = write!(f, "{} {}", now(), holder);
         }
         match fs::hard_link(&tmp, &path) {
@@ -90,7 +98,10 @@ pub struct Guard {
 impl Guard {
     pub fn new(base: &Path, holder: &str) -> Guard {
         acquire(base, holder);
-        Guard { base: base.to_path_buf(), holder: holder.to_string() }
+        Guard {
+            base: base.to_path_buf(),
+            holder: holder.to_string(),
+        }
     }
 }
 
@@ -102,7 +113,12 @@ impl Drop for Guard {
 
 fn read_lock(path: &Path) -> Option<(u64, String)> {
     let mut s = String::new();
-    OpenOptions::new().read(true).open(path).ok()?.read_to_string(&mut s).ok()?;
+    OpenOptions::new()
+        .read(true)
+        .open(path)
+        .ok()?
+        .read_to_string(&mut s)
+        .ok()?;
     let mut it = s.split_whitespace();
     let ts = it.next()?.parse::<u64>().ok()?;
     let who = it.next().unwrap_or("").to_string();

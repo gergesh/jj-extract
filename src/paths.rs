@@ -16,22 +16,54 @@ pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Root for the best-effort hook error log: `$JJ_EXTRACT_HOME` or `~/.claude/jj-extract`.
+/// Root for the best-effort hook error log: `$JJ_EXTRACT_HOME` or `~/.jj-extract`.
 pub fn central_root() -> PathBuf {
     if let Some(over) = std::env::var_os("JJ_EXTRACT_HOME") {
         return PathBuf::from(over);
     }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".claude").join("jj-extract")
+    home.join(".jj-extract")
 }
 
 /// Return `p` as a POSIX-style path relative to `root`, or None if outside it.
 pub fn relpath_within(p: &str, root: &Path) -> Option<String> {
     let pp = Path::new(p);
-    let abs = if pp.is_absolute() { pp.to_path_buf() } else { root.join(pp) };
+    let abs = if pp.is_absolute() {
+        pp.to_path_buf()
+    } else {
+        root.join(pp)
+    };
     // Canonicalize the existing prefix so symlinks in the repo path don't defeat
     // the strip; fall back to lexical if the file was since deleted.
     let abs = abs.canonicalize().unwrap_or(abs);
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    abs.strip_prefix(&root).ok().map(|r| r.to_string_lossy().replace('\\', "/"))
+    let relative = abs.strip_prefix(&root).ok()?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relpath_within;
+
+    #[test]
+    fn rejects_nonexistent_paths_that_lexically_escape_the_repo() {
+        let root = std::env::temp_dir().join("jj-extract-path-test-root");
+        let escaped = root.join("..").join("outside").join("missing.txt");
+        assert_eq!(relpath_within(&escaped.to_string_lossy(), &root), None);
+    }
+
+    #[test]
+    fn accepts_repo_relative_paths() {
+        let root = std::env::temp_dir().join("jj-extract-path-test-root");
+        assert_eq!(
+            relpath_within("src/main.rs", &root).as_deref(),
+            Some("src/main.rs")
+        );
+    }
 }

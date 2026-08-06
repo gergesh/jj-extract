@@ -2,8 +2,13 @@
 name = "jj-extract"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Per-agent change attribution for a shared jj working copy: edits are recorded into jj's evolog, then `jj extract` pulls each agent's edits into their own change."
 license = "MIT"
+repository = "https://github.com/gergesh/jj-extract"
+readme = "README.md"
+keywords = ["jujutsu", "jj", "claude", "codex", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 # Binary named `jj-extract` so `jj extract …` invokes it as a native jj subcommand.
 [[bin]]

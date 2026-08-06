@@ -1,0 +1,4 @@
+interface:
+  display_name: "jj extract"
+  short_description: "Extract this agent's edits into one jj change"
+  default_prompt: "Use $jj-extract to extract this session's edits into one linear jj change."

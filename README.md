@@ -1,97 +1,224 @@
 # jj-extract
 
-Multiple Claude Code agents share **one** jj working copy. Every edit is recorded
-automatically into jj's evolution log — tagged with the acting session — and
-**`jj extract`** pulls a session's edits into their **own jj change**, isolated at
-line granularity, with jj's rebase engine doing the content math.
+`jj-extract` separates edits made by multiple Claude Code or Codex sessions that
+share a single [Jujutsu](https://jj-vcs.github.io/jj/latest/) working copy. Agent
+hooks record each file edit in `jj`'s evolution log; later, `jj extract`
+reconstructs one session's edits as an independent change.
 
-There's nothing to start: recording is a hook that tags each edit's snapshot.
-`jj extract` is the one command an agent runs, when it wants its work as a commit.
-
-```
-record (a hook, per edit)                     extract (jj extract)
-  Pre : jj st (neutral) + take edit lock         read @'s evolog
-  Post: jj st tagged with the session            for my tagged evolutions:
-        release lock                               delta = diff(prev, this)
-  → the evolution is attributed in the op log      rebase/squash onto @'s parent
+```console
+$ jj extract -m "Improve install errors"
+✓ extracted session 2fb... → change yxw... in stack (inspect: jj show yxw...)
 ```
 
-Installed as `jj-extract`, it's also the native jj subcommand `jj extract …`.
+There is no start or tracking command. Once the hooks are installed, recording
+is automatic and extraction is idempotent: running it again updates the same
+session change instead of creating duplicates.
 
-## The one command agents use
+## Requirements
 
-```bash
-jj extract -m "what I did"   # pull my edits into their own change
-jj extract --all             # build a change for every session in the evolog
-```
+- A `jj` repository and the `jj` CLI on `PATH`
+- Rust and Cargo to install from source
+- Claude Code or Codex for automatic edit recording
 
-## The idea: jj's evolog *is* the ledger
-
-`jj st` snapshots the working copy into a content-addressed commit, and `jj evolog
--r @` lists every such snapshot with the *operation* that made it. If each edit's
-snapshot is tagged with its agent (`JJ_OP_USERNAME`), then the evolog already
-records who changed what — no sidecar, no separate store. `jj extract` reads it
-back: an agent's change is the composition of *its* evolutions' deltas, replayed
-onto `@`'s parent.
-
-Why not track line numbers? Because they lie — if agent 1 appends at the bottom
-and agent 2 inserts at the top, agent 1's line moved. jj-extract does no line
-bookkeeping; it diffs content-addressed snapshots and lets jj's rebase compose
-them. Two agents editing the same lines is the one irreducible case, surfaced as a
-conflict in the extracted change.
-
-## How isolation works
-
-- **Peers.** Each edit is bracketed by an **edit lock** (PreToolUse takes it,
-  PostToolUse releases it), so a peer can't write while an edit is in flight —
-  your snapshot captures only your edit. The lock guards just a fast
-  write+snapshot, and is uncontended when you're editing alone. *(Verified clean
-  at 24 simultaneous agents.)*
-- **Non-tool changes.** Only `Edit`/`Write`/`MultiEdit` are hooked. A Bash/human
-  change to a file lands on disk and is flushed to an *unattributed* evolution by
-  the neutral pre-snapshot, so it never folds into an agent's change.
+`jj-extract` is intentionally jj-native. A plain Git repository without a `.jj`
+working copy is not supported.
 
 ## Install
 
-```bash
-cargo install --path .        # puts `jj-extract` on PATH
-jj-extract --install          # register the hooks + the `jj extract` alias (global)
-jj-extract --install --project  # …or just this repo's .claude/settings.json
-jj-extract --uninstall        # remove them again (leaves other hooks intact)
-```
-
-`--install` merges into your Claude settings (preserving every other key and hook,
-with a `*.jj-extract-bak` backup) and registers `jj extract` as a jj user alias via
-`jj util exec`. A **skill** at `.claude/skills/jj-extract/` tells agents to run
-`jj extract` when they finish; copy it where your agents run.
-
-Recording is **always-on** once installed — every edit pays a fast tagged snapshot
-and an (uncontended-when-solo) lock. That's the cost of never needing a "start"
-step; `jj op log` also becomes a permanent record of who edited what.
-
-## CLI
-
-| Invocation | What it does |
-|---|---|
-| `jj extract [-m MSG]` | Pull this session's edits into their own change |
-| `jj extract --all` | Build a change for every session found in the evolog |
-| `jj-extract --install [--project]` | Register the hooks + `jj extract` alias |
-| `jj-extract --uninstall [--project]` | Remove them |
-| `jj-extract --hook` | Hook entry point (used in settings.json; not for manual use) |
-
-## Scope
-
-jj-native, by design (`git` is intentionally not a target). Only the file-editing
-tools are recorded; a file changed by an arbitrary `Bash` command is unattributed.
-
-## Test
+From this repository:
 
 ```bash
-cargo build
-tests/integration.sh          # drives the real binary via synthetic hook JSON
+cargo install --locked --path .
+jj-extract --install
 ```
 
-Covers same-file line-shift splitting, concurrent different-file editing,
-non-tool-change isolation, single-session extract, and multi-edit composition. The
-concurrency ceiling is exercised separately (24 simultaneous agents record and
-extract with no loss).
+The second command does three things:
+
+1. Merges `SessionStart`, `PreToolUse`, and `PostToolUse` entries into
+   `~/.claude/settings.json`.
+2. Merges native `apply_patch` hooks into `~/.codex/hooks.json` (or
+   `$CODEX_HOME/hooks.json`).
+3. Adds a user-level `jj extract` alias that invokes the installed binary.
+
+To install both integrations for only the current repository, run this from
+inside that jj working copy:
+
+```bash
+jj-extract --install --project
+```
+
+This writes `.claude/settings.json` and `.codex/hooks.json` in the repository.
+The `jj extract` alias is still user-level because jj aliases are independent of
+agent project settings. Existing settings and hooks are preserved. When an
+existing config file is changed, its previous contents are saved beside it with
+the `.jj-extract-bak` suffix. Both destinations are validated before either is
+changed, so invalid JSON or an unexpected hooks structure cannot cause a partial
+install.
+
+Verify the installation:
+
+```bash
+jj extract --help
+jj config get aliases.extract
+```
+
+Restart active agent sessions after installing. Codex requires new or changed
+non-managed hooks to be reviewed and trusted: open `/hooks` after restart. A
+project install also requires Codex to trust the repository's `.codex` layer;
+see the [Codex hooks guide](https://developers.openai.com/codex/hooks).
+
+## Use
+
+An individual session normally runs one command when its work is ready:
+
+```bash
+jj extract -m "Short description of the work"
+```
+
+Useful variants:
+
+```bash
+jj extract --agent <session-id>  # extract an explicitly named session
+jj extract --all                 # extract every recorded session
+```
+
+`--agent` is useful outside the originating agent process. In normal use,
+identity comes from `JJ_EXTRACT_AGENT`, `CLAUDE_CODE_SESSION_ID`, or
+`CODEX_THREAD_ID`.
+
+After extraction, the shared live working-copy change remains checked out and its
+files are unchanged. Extracted changes are inserted as a chronological stack
+between the original base and live `@`; the live change is rebased on top. Each
+stack entry's diff contains only that session's edits, while edits that were not
+attributed remain in `@`.
+
+This produces one linear head instead of a sibling branch per session. It also
+lets a later session build on an earlier session's extracted change, avoiding
+false conflicts for causally dependent edits. Inspect an entry with the
+`jj show <change-id>` command printed in the result.
+
+If an older jj-extract release already left session changes as sibling heads,
+the next extraction linearizes those owned changes while preserving their change
+IDs.
+
+If two sessions edit the same lines, jj may produce a conflict. `jj-extract`
+reports that explicitly and leaves the conflict in the extracted change for
+normal jj conflict resolution.
+
+## How recording works
+
+```text
+PreToolUse                         PostToolUse
+  acquire repository edit lock      snapshot with the session as jj's op user
+  neutral `jj status` snapshot      release the edit lock
+  allow the file tool to run
+
+`jj extract`
+  read @'s evolutions → replay session deltas → stack them → rebase live @ on top
+```
+
+The neutral pre-snapshot separates changes already present on disk from the
+upcoming tool edit. The lock in `.jj/jj-extract.lock` prevents two file tools
+from writing during the same attribution window. It is time-bounded so a missing
+post-hook cannot permanently block later edits.
+
+Extraction uses content-addressed snapshots and jj's three-way merge rather than
+remembering line numbers. That keeps attribution correct when another session
+inserts or deletes lines earlier in the same file.
+
+## Scope and limitations
+
+- Automatic attribution covers Claude Code's `Edit`, `Write`, and `MultiEdit`
+  tools and Codex's `apply_patch` tool, including add, update, delete, and move
+  paths.
+- Changes made by Bash commands, formatters, humans, or other tools are recorded
+  neutrally and are not included in a session's extracted change.
+- Recording adds a fast jj snapshot around every supported file edit.
+- Hook failures never block the agent's tool call. Best-effort diagnostics are
+  appended to `~/.jj-extract/hook-error.log` (or
+  `$JJ_EXTRACT_HOME/hook-error.log`).
+- Extraction failures are shown on stderr. The command attempts to restore the
+  original working copy before returning a non-zero exit status.
+
+## Troubleshooting
+
+**`Could not determine which session you are`**
+
+Restart the agent after installation, or pass `--agent <session-id>`. In Codex,
+also review the integration with `/hooks`. For a deliberately named process,
+export `JJ_EXTRACT_AGENT` before editing.
+
+**`Not inside a jj repo`**
+
+Run the command within a directory whose ancestor contains `.jj`. If this is a
+Git repository, colocate jj first with `jj git init --colocate` if that matches
+your workflow.
+
+**`jj extract` is not recognized**
+
+Confirm `jj-extract` is on `PATH`, rerun `jj-extract --install`, and inspect
+`jj config get aliases.extract`. Installer failures now return a non-zero status
+with the underlying `jj config` error.
+
+**Nothing is extracted**
+
+Only supported file-tool edits made after hook installation are attributed.
+Check `jj evolog -r @` and the hook error log. Bash-created changes are omitted
+by design.
+
+## Uninstall
+
+```bash
+jj-extract --uninstall            # global Claude/Codex hooks and the jj alias
+jj-extract --uninstall --project  # project Claude/Codex hooks and the jj alias
+```
+
+Other Claude Code and Codex settings and hook entries are left intact.
+
+## Development
+
+Run the complete local quality gate:
+
+```bash
+scripts/check.sh
+```
+
+It checks formatting, runs Clippy with warnings denied, executes the Rust unit
+tests, rebuilds the real binary, and then runs the shell integration suite.
+
+The integration suite drives synthetic Claude Code and Codex hook JSON through
+the real binary and currently covers:
+
+- interleaved same-file edits whose line positions move;
+- concurrent edits serialized by the repository lock;
+- exclusion of non-tool changes;
+- single-session and all-session extraction;
+- composition of multiple edits and new files;
+- stable, duplicate-free re-extraction;
+- a single linear head with no divergent change IDs;
+- conflict-free stacking of causally dependent session edits;
+- automatic linearization of legacy sibling extraction heads;
+- isolated dual-client install/uninstall and settings preservation;
+- Codex `apply_patch` attribution and `CODEX_THREAD_ID` identity;
+- malformed settings and incompatible CLI option failures.
+
+To run only that suite:
+
+```bash
+cargo build --locked
+tests/integration.sh
+```
+
+Source layout:
+
+- `src/hook.rs` records attributed snapshots.
+- `src/construct.rs` reconstructs isolated changes.
+- `src/jj.rs` contains the jj CLI boundary.
+- `src/install.rs` safely merges and removes Claude Code and Codex hooks.
+- `src/lock.rs` implements the cross-hook edit lock.
+- `.agents/skills/jj-extract` teaches Codex the extraction workflow.
+- `.claude/skills/jj-extract` provides the equivalent Claude Code skill.
+
+## License
+
+[MIT](LICENSE)

@@ -1,5 +1,6 @@
 # Rust
 /target/
 
-# jj-extract keeps its lock centrally under ~/.claude/jj-extract/, never in-repo.
+# Backups and interrupted temporary writes from project-scoped hook installation.
 *.jj-extract-bak
+*.jj-extract-tmp-*

@@ -8,6 +8,10 @@
 //! exactly the agent's own edit, so no file scoping is needed. Single-threaded.
 
 use crate::jj::{Evolution, Jj};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_SCAFFOLD: AtomicU64 = AtomicU64::new(0);
 
 pub struct Built {
     pub session: String,
@@ -28,7 +32,9 @@ pub fn session_trailer(session: &str) -> String {
 /// The description put on an extracted change: the user's message (or a default
 /// first line) plus the [`session_trailer`] so re-runs are idempotent.
 fn extraction_desc(session: &str, message: Option<&str>) -> String {
-    let body = message.map(|m| m.to_string()).unwrap_or_else(|| format!("jj-extract: {session}"));
+    let body = message
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| format!("jj-extract: {session}"));
     format!("{body}\n\n{}", session_trailer(session))
 }
 
@@ -42,51 +48,90 @@ pub fn reconcile_idempotent(
     session: &str,
     fresh: &str,
     message: Option<&str>,
-) -> (String, bool) {
+) -> Result<(String, bool), String> {
     let trailer = session_trailer(session);
-    let priors: Vec<String> =
-        jj.changes_with_description(&trailer).into_iter().filter(|c| c != fresh).collect();
-    let existing = match priors.first() {
+    let priors: Vec<String> = jj
+        .changes_with_description(&trailer)?
+        .into_iter()
+        .filter(|c| c != fresh)
+        .collect();
+    let existing = match priors.first().cloned() {
         Some(e) => e,
-        None => return (fresh.to_string(), false),
+        None => return Ok((fresh.to_string(), false)),
     };
-    jj.restore_into(existing, fresh); // existing's tree ← fresh's tree
-    jj.describe(existing, &extraction_desc(session, message));
-    jj.abandon(fresh);
+    jj.restore_into(&existing, fresh)
+        .require("could not update the previous extraction's content")?;
+    jj.describe(&existing, &extraction_desc(session, message))
+        .require("could not update the previous extraction's description")?;
+    jj.abandon(fresh)
+        .require("could not discard the temporary extracted change")?;
     for extra in &priors[1..] {
-        jj.abandon(extra); // collapse any earlier duplicates too
+        jj.abandon(extra)
+            .require("could not discard a duplicate prior extraction")?;
     }
-    (existing.clone(), true)
+    Ok((existing, true))
 }
 
 /// The agents present in the evolog: every tagging user except the neutral one
 /// (the base evolution's user, used for pre-snapshots and pre-recording state).
 pub fn agents_in(evolog: &[Evolution]) -> Vec<String> {
     let neutral = evolog.first().map(|e| e.user.as_str()).unwrap_or("");
-    let mut seen = std::collections::BTreeSet::new();
+    let mut agents = Vec::new();
     for e in evolog {
-        if e.user != neutral {
-            seen.insert(e.user.clone());
+        if e.user != neutral && !agents.contains(&e.user) {
+            agents.push(e.user.clone());
         }
     }
-    seen.into_iter().collect()
+    agents
+}
+
+/// Arrange every extracted session as a linear stack between the original base
+/// and the live working-copy change. Each extracted change still contains only
+/// that session's diff, but causal edits can build on earlier sessions and the
+/// repository is left with one tool-created head instead of one sibling head per
+/// extraction.
+pub fn stack_extractions(
+    jj: &Jj,
+    base: &str,
+    live: &str,
+    evolog: &[Evolution],
+) -> Result<(), String> {
+    let mut tip = base.to_string();
+    for session in agents_in(evolog) {
+        let trailer = session_trailer(&session);
+        let Some(change) = jj.changes_with_description(&trailer)?.into_iter().next() else {
+            continue;
+        };
+        if change != tip {
+            jj.rebase_onto(&change, &tip)
+                .require("could not stack an extracted session change")?;
+        }
+        tip = change;
+    }
+    if tip != base {
+        jj.rebase_onto(live, &tip)
+            .require("could not place the live working copy on the extraction stack")?;
+    }
+    Ok(())
 }
 
 /// Build one agent's change from the evolog (chronological), rebased onto `base`.
 ///
 /// The recorded evolutions all share `@`'s change id, so we must never make one a
 /// graph commit (that would fork `@` into divergent versions). Instead, for each
-/// evolution we build the delta on **fresh throwaway commits** whose *content* is
-/// restored from `pre`/`post` — a pre-image commit, then a child holding `post`'s
-/// content, so its diff-vs-parent is exactly `diff(pre, post)`. We rebase that
-/// delta onto the accumulator and abandon the pre-image.
+/// evolution we build the delta on **fresh throwaway commits** created with
+/// `--no-edit`, so the live working-copy change is never left or auto-abandoned.
+/// Their *content* is restored from `pre`/`post` — a pre-image commit, then a
+/// child holding `post`'s content — making the child's diff exactly
+/// `diff(pre, post)`. We rebase that delta onto the accumulator and abandon the
+/// pre-image.
 pub fn build_one(
     jj: &Jj,
     base: &str,
     session: &str,
     evolog: &[Evolution],
     message: Option<&str>,
-) -> Option<Built> {
+) -> Result<Option<Built>, String> {
     let mut acc: Option<String> = None; // the agent's accumulating change id
     let mut scaffolds: Vec<String> = vec![]; // throwaway pre-image commits to abandon
 
@@ -99,43 +144,57 @@ pub fn build_one(
 
         // Fresh pre-image commit on base, with pre's *content* (restore, not
         // resurrect the evolution).
-        if !jj.new_on(base).ok {
-            continue;
-        }
-        jj.restore_from(pre);
-        jj.snapshot();
-        let preimg = match jj.change_id("@") {
-            Some(c) => c,
-            None => continue,
-        };
+        let preimg = jj.new_no_edit(base, &scaffold_marker("pre"))?;
+        jj.restore_into(&preimg, pre)
+            .require("could not restore an edit's pre-image")?;
         // Fresh child holding post's content → its diff vs the pre-image is
         // exactly diff(pre, post): this agent's edit for that step.
-        jj.new_empty();
-        jj.restore_from(post);
-        jj.snapshot();
-        let delta = match jj.change_id("@") {
-            Some(d) => d,
-            None => continue,
-        };
+        let delta = jj.new_no_edit(&preimg, &scaffold_marker("post"))?;
+        jj.restore_into(&delta, post)
+            .require("could not restore an edit's post-image")?;
 
         match &acc {
             None => {
-                jj.rebase_onto(&delta, base);
+                jj.rebase_onto(&delta, base)
+                    .require("could not rebase the first recorded edit onto the base")?;
                 acc = Some(delta);
             }
             Some(c) => {
-                jj.rebase_onto(&delta, c);
-                jj.squash_into(&delta, c);
+                jj.rebase_onto(&delta, c)
+                    .require("could not compose a recorded edit onto the extraction")?;
+                jj.squash_into(&delta, c)
+                    .require("could not combine a recorded edit with the extraction")?;
             }
         }
         scaffolds.push(preimg);
     }
 
-    let change = acc?;
+    let Some(change) = acc else {
+        return Ok(None);
+    };
     for s in &scaffolds {
-        jj.abandon(s); // childless now (their deltas were rebased away)
+        jj.abandon(s)
+            .require("could not clean up a temporary extraction change")?;
     }
-    jj.describe(&change, &extraction_desc(session, message));
-    let conflict = jj.is_conflict(&change);
-    Some(Built { session: session.to_string(), change_id: change, conflict, updated: false })
+    jj.describe(&change, &extraction_desc(session, message))
+        .require("could not describe the extracted change")?;
+    let conflict = jj.is_conflict(&change)?;
+    Ok(Some(Built {
+        session: session.to_string(),
+        change_id: change,
+        conflict,
+        updated: false,
+    }))
+}
+
+fn scaffold_marker(kind: &str) -> String {
+    let sequence = NEXT_SCAFFOLD.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "jj-extract temporary {kind} {} {timestamp} {sequence}",
+        std::process::id()
+    )
 }

@@ -19,6 +19,28 @@ pub struct Jj {
 pub struct Run {
     pub ok: bool,
     pub stdout: String,
+    pub stderr: String,
+}
+
+impl Run {
+    /// Turn a failed jj invocation into an actionable error while preserving the
+    /// successful result for callers that need its output.
+    pub fn require(self, context: &str) -> Result<Run, String> {
+        if self.ok {
+            return Ok(self);
+        }
+        let detail = self.stderr.trim();
+        let detail = if detail.is_empty() {
+            self.stdout.trim()
+        } else {
+            detail
+        };
+        if detail.is_empty() {
+            Err(format!("{context}: jj exited unsuccessfully"))
+        } else {
+            Err(format!("{context}: {detail}"))
+        }
+    }
 }
 
 /// One evolution of `@`: its commit id and the username on the operation that
@@ -30,12 +52,16 @@ pub struct Evolution {
 
 impl Jj {
     pub fn new(root: &Path) -> Jj {
-        Jj { root: root.to_path_buf() }
+        Jj {
+            root: root.to_path_buf(),
+        }
     }
 
     fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> Run {
         let mut cmd = Command::new("jj");
-        cmd.args(args).current_dir(&self.root).env("JJ_EDITOR", "true");
+        cmd.args(args)
+            .current_dir(&self.root)
+            .env("JJ_EDITOR", "true");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -43,8 +69,13 @@ impl Jj {
             Ok(o) => Run {
                 ok: o.status.success(),
                 stdout: String::from_utf8_lossy(&o.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&o.stderr).to_string(),
             },
-            Err(_) => Run { ok: false, stdout: String::new() },
+            Err(e) => Run {
+                ok: false,
+                stdout: String::new(),
+                stderr: e.to_string(),
+            },
         }
     }
 
@@ -72,8 +103,11 @@ impl Jj {
     /// each is a tagged evolution, and the builder composes them.
     pub fn snapshot_tagged(&self, agent: &str, paths: &[String]) {
         let env = [("JJ_OP_USERNAME", agent)];
-        let existing: Vec<&str> =
-            paths.iter().filter(|p| self.root.join(p).exists()).map(|s| s.as_str()).collect();
+        let existing: Vec<&str> = paths
+            .iter()
+            .filter(|p| self.root.join(p).exists())
+            .map(|s| s.as_str())
+            .collect();
         if existing.is_empty() {
             let _ = self.run_env(&["status"], &env);
             return;
@@ -89,39 +123,37 @@ impl Jj {
     // --- construct -----------------------------------------------------------
 
     /// `@`'s evolutions, oldest first, each with the tagging operation's user.
-    pub fn evolog(&self) -> Vec<Evolution> {
-        let r = self.run(&[
-            "evolog",
-            "-r",
-            "@",
-            "-T",
-            r#"commit.commit_id().short() ++ " " ++ operation.user() ++ "\n""#,
-            "--no-graph",
-        ]);
-        if !r.ok {
-            return vec![];
-        }
+    pub fn evolog(&self) -> Result<Vec<Evolution>, String> {
+        let r = self
+            .run(&[
+                "evolog",
+                "-r",
+                "@",
+                "-T",
+                r#"commit.commit_id().short() ++ " " ++ operation.user() ++ "\n""#,
+                "--no-graph",
+            ])
+            .require("could not read the working-copy evolution log")?;
         let mut evos: Vec<Evolution> = r
             .stdout
             .lines()
-            .filter_map(|l| {
-                let (commit, user) = l.trim().split_once(' ')?;
-                // op.user() is "name@host"; keep the name.
-                let user = user.split('@').next().unwrap_or(user);
-                Some(Evolution { commit: commit.to_string(), user: user.to_string() })
-            })
-            .collect();
+            .filter(|line| !line.trim().is_empty())
+            .map(parse_evolution)
+            .collect::<Result<_, _>>()?;
         evos.reverse(); // evolog is newest-first; we want chronological
-        evos
+        Ok(evos)
     }
 
-    pub fn new_on(&self, rev: &str) -> Run {
-        self.run(&["new", rev])
-    }
-
-    /// Make the working copy's content equal to `rev`'s (all files).
-    pub fn restore_from(&self, rev: &str) -> Run {
-        self.run(&["restore", "--from", rev])
+    /// Create a throwaway change without moving the working copy, then return
+    /// its id. The unique description lets us identify the new change without
+    /// parsing jj's human-oriented command output.
+    pub fn new_no_edit(&self, parent: &str, marker: &str) -> Result<String, String> {
+        self.run(&["new", "--no-edit", "-m", marker, parent])
+            .require("could not create a temporary extraction change")?;
+        self.changes_with_description(marker)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "jj did not return the temporary extraction change id".to_string())
     }
 
     /// Overwrite `into`'s tree with `from`'s (all files), preserving `into`'s
@@ -131,22 +163,24 @@ impl Jj {
     }
 
     /// Change ids of visible commits whose description contains `needle`.
-    pub fn changes_with_description(&self, needle: &str) -> Vec<String> {
+    pub fn changes_with_description(&self, needle: &str) -> Result<Vec<String>, String> {
         let pat = serde_json::to_string(needle).unwrap_or_default();
         let revset = format!("description(substring:{pat})");
-        let r = self.run(&["log", "-r", &revset, "--no-graph", "-T", r#"change_id.short() ++ "\n""#]);
-        if !r.ok {
-            return vec![];
-        }
-        r.stdout.lines().map(|l| l.trim().to_string()).filter(|s| !s.is_empty()).collect()
-    }
-
-    pub fn new_empty(&self) -> Run {
-        self.run(&["new"])
-    }
-
-    pub fn snapshot(&self) {
-        let _ = self.run(&["status"]);
+        let r = self
+            .run(&[
+                "log",
+                "-r",
+                &revset,
+                "--no-graph",
+                "-T",
+                r#"change_id.short() ++ "\n""#,
+            ])
+            .require("could not query changes by description")?;
+        Ok(r.stdout
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
     }
 
     pub fn rebase_onto(&self, change: &str, dest: &str) -> Run {
@@ -154,7 +188,14 @@ impl Jj {
     }
 
     pub fn squash_into(&self, from: &str, into: &str) -> Run {
-        self.run(&["squash", "--from", from, "--into", into, "--use-destination-message"])
+        self.run(&[
+            "squash",
+            "--from",
+            from,
+            "--into",
+            into,
+            "--use-destination-message",
+        ])
     }
 
     /// Restore the working copy to `rev` in place, preserving its change id (and
@@ -176,12 +217,58 @@ impl Jj {
         (r.ok && !id.is_empty()).then_some(id)
     }
 
-    pub fn is_conflict(&self, rev: &str) -> bool {
-        let r = self.run(&["log", "-r", rev, "-T", r#"if(conflict,"1","0")"#, "--no-graph"]);
-        r.stdout.trim() == "1"
+    pub fn is_conflict(&self, rev: &str) -> Result<bool, String> {
+        let r = self
+            .run(&[
+                "log",
+                "-r",
+                rev,
+                "-T",
+                r#"if(conflict,"1","0")"#,
+                "--no-graph",
+            ])
+            .require("could not inspect the extracted change for conflicts")?;
+        Ok(r.stdout.trim() == "1")
     }
 
     pub fn describe(&self, rev: &str, message: &str) -> Run {
         self.run(&["describe", "-r", rev, "-m", message])
+    }
+}
+
+fn parse_evolution(line: &str) -> Result<Evolution, String> {
+    let (commit, operation_user) = line
+        .trim()
+        .split_once(' ')
+        .ok_or_else(|| format!("could not parse jj evolog output: {line:?}"))?;
+    // operation.user() is "name@host". Split from the right so deliberately
+    // named agents such as "team@agent" retain the complete identity.
+    let user = operation_user
+        .rsplit_once('@')
+        .map(|(name, _host)| name)
+        .unwrap_or(operation_user);
+    if commit.is_empty() || user.is_empty() {
+        return Err(format!("could not parse jj evolog output: {line:?}"));
+    }
+    Ok(Evolution {
+        commit: commit.to_string(),
+        user: user.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_evolution;
+
+    #[test]
+    fn parses_agent_names_containing_at_signs() {
+        let evolution = parse_evolution("abc123 team@agent@workstation").unwrap();
+        assert_eq!(evolution.commit, "abc123");
+        assert_eq!(evolution.user, "team@agent");
+    }
+
+    #[test]
+    fn rejects_unexpected_evolog_output() {
+        assert!(parse_evolution("missing-user").is_err());
     }
 }
