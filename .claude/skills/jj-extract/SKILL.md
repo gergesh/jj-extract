@@ -16,13 +16,24 @@ recorded automatically (a hook tags it with your session), so there's nothing to
 start. When you want your work as its own commit, run:
 
 ```bash
-jj extract -m "<short description of what you did>"
+jj extract
 ```
 
 That reconstructs a jj change containing your attributed edits and prints its
 id. Extracted session changes are kept in first-edit order as a linear stack
 below the live working copy, so the command does not leave a sibling branch per
 agent.
+
+Then describe it — after looking at what actually landed in it, not from memory:
+
+```bash
+jj show <change-id>
+jj describe -r <change-id>   # or -m "<what changed and why>"
+```
+
+`jj extract` writes no description of its own, and never overwrites yours:
+re-running it after more edits updates the same change and leaves your words
+alone.
 
 ## Why
 
@@ -36,6 +47,8 @@ avoid a false conflict.
 ## Notes
 
 - Nothing to do up front — just edit; recording is automatic.
+- Describe the change yourself with `jj describe` once you can see the whole
+  diff; there is no `-m` on `jj extract`.
 - `jj extract` is safe to run alongside other agents.
 - The live working-copy change and file contents are preserved; attributed edits
   move into the extraction stack and independent unattributed edits remain in

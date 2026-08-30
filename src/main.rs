@@ -43,24 +43,21 @@ struct Cli {
     #[arg(
         long,
         hide = true,
-        conflicts_with_all = ["install", "uninstall", "project", "all", "message", "agent"]
+        conflicts_with_all = ["install", "uninstall", "project", "all", "agent"]
     )]
     hook: bool,
     /// Register Claude Code and Codex hooks, plus `jj extract` as a jj alias.
-    #[arg(long, conflicts_with_all = ["all", "message", "agent"])]
+    #[arg(long, conflicts_with_all = ["all", "agent"])]
     install: bool,
     /// Remove the hooks and the jj alias.
-    #[arg(long, conflicts_with_all = ["all", "message", "agent"])]
+    #[arg(long, conflicts_with_all = ["all", "agent"])]
     uninstall: bool,
     /// With --install/--uninstall: target this repo's hook configs, not global ones.
     #[arg(long, requires = "management")]
     project: bool,
     /// Extract a change for every session found in the evolog, not just this one.
-    #[arg(long, conflicts_with_all = ["message", "agent"])]
+    #[arg(long, conflicts_with = "agent")]
     all: bool,
-    /// Description for the extracted change.
-    #[arg(short = 'm', long)]
-    message: Option<String>,
     /// Session to extract (default: the current agent's exported session identity).
     #[arg(long)]
     agent: Option<String>,
@@ -75,7 +72,7 @@ fn main() {
     } else if cli.uninstall {
         cmd_uninstall(cli.project)
     } else {
-        cmd_extract(cli.message, cli.agent, cli.all)
+        cmd_extract(cli.agent, cli.all)
     };
     exit(code);
 }
@@ -83,7 +80,7 @@ fn main() {
 // --------------------------------------------------------------------------- //
 // extract — the one command agents use
 // --------------------------------------------------------------------------- //
-fn cmd_extract(message: Option<String>, agent_opt: Option<String>, all: bool) -> i32 {
+fn cmd_extract(agent_opt: Option<String>, all: bool) -> i32 {
     let root = match repo_root() {
         Some(r) => r,
         None => {
@@ -109,17 +106,14 @@ fn cmd_extract(message: Option<String>, agent_opt: Option<String>, all: bool) ->
         return 0;
     }
 
-    let targets: Vec<(String, Option<String>)> = if all {
+    let targets: Vec<String> = if all {
         construct::agents_in(&evolog)
-            .into_iter()
-            .map(|a| (a, None))
-            .collect()
     } else {
         let agent = match resolve_agent(agent_opt) {
             Some(a) => a,
             None => return 2,
         };
-        vec![(agent, message)]
+        vec![agent]
     };
 
     let built = match construct::extract(&root, &jj, &evolog, &targets) {
@@ -219,7 +213,8 @@ fn cmd_install(project: bool) -> i32 {
         }
     }
     println!(
-        "\nRecording is automatic. Agents run `jj extract -m \"<task>\"` to pull their change."
+        "\nRecording is automatic. Agents run `jj extract` to pull their change, then\n\
+         describe it with `jj describe`."
     );
     println!(
         "Restart active agent sessions. In Codex, open `/hooks` and trust the new hook definition."
@@ -379,7 +374,7 @@ mod tests {
     fn rejects_options_that_would_be_silently_ignored() {
         for args in [
             vec!["jj-extract", "--project"],
-            vec!["jj-extract", "--all", "--message", "ignored"],
+            vec!["jj-extract", "--all", "--message", "gone"],
             vec!["jj-extract", "--all", "--agent", "ignored"],
             vec!["jj-extract", "--install", "--all"],
             vec!["jj-extract", "--hook", "--all"],

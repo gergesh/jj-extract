@@ -6,8 +6,9 @@ hooks record each file edit in `jj`'s evolution log; later, `jj extract`
 reconstructs one session's edits as an independent change.
 
 ```console
-$ jj extract -m "Improve install errors"
+$ jj extract
 ✓ extracted session 2fb... → change yxw... in stack (inspect: jj show yxw...)
+$ jj describe -r yxw... -m "Improve install errors"
 ```
 
 There is no start or tracking command. Once the hooks are installed, recording
@@ -72,8 +73,14 @@ see the [Codex hooks guide](https://developers.openai.com/codex/hooks).
 An individual session normally runs one command when its work is ready:
 
 ```bash
-jj extract -m "Short description of the work"
+jj extract
 ```
+
+Extraction writes no description. A new change starts with a `jj-extract:
+<session>` placeholder for its author to replace with `jj describe`, having read
+the change that was actually built; re-extraction then leaves that description
+alone. Descriptions written blind, before the change exists, are the ones worth
+nobody's time.
 
 Useful variants:
 

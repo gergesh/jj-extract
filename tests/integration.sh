@@ -220,9 +220,12 @@ ok "malformed Codex hooks fail before Claude settings are changed" \
   "[ '$MALFORMED_STATUS' -ne 0 ] && cmp -s .claude/settings.json '$WORK/claude-before.json' && [ ! -e .claude/settings.json.jj-extract-bak ]"
 
 echo "== I: incompatible CLI options fail instead of being ignored =="
-"$BIN" --all --message ignored >/dev/null 2>&1
+"$BIN" --all --message "written by the agent" >/dev/null 2>&1
 CLI_STATUS=$?
-ok "--all rejects an ignored --message" "[ '$CLI_STATUS' -eq 2 ]"
+ok "the removed --message is rejected, not ignored" "[ '$CLI_STATUS' -eq 2 ]"
+"$BIN" --all --agent ignored >/dev/null 2>&1
+CLI_STATUS=$?
+ok "--all rejects an ignored --agent" "[ '$CLI_STATUS' -eq 2 ]"
 "$BIN" --project >/dev/null 2>&1
 CLI_STATUS=$?
 ok "--project requires install or uninstall" "[ '$CLI_STATUS' -eq 2 ]"
@@ -395,6 +398,8 @@ jj describe -r "$ID1" -m 'entirely my own words' >/dev/null 2>&1
 edit a1 f.txt $'TOP\nl1\nl2\nl3\nONE\n'
 ID2="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
 ok "a re-described change is still updated in place" "[ -n '$ID1' ] && [ '$ID1' = '$ID2' ]"
+ok "the author's own description survives re-extraction" \
+  "desc '$ID2' | grep -q '^entirely my own words$'"
 ok "re-extraction creates no duplicate change"       "[ \"$(n_commits)\" = 3 ]"
 ok "the update carries both edits"                   "has '$ID2' ONE && has '$ID2' TOP"
 

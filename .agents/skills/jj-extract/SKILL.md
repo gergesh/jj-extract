@@ -15,7 +15,14 @@ file edit with the current session identity, so there is nothing to start. When
 the current work is ready, run:
 
 ```bash
-jj extract -m "<short description of what you did>"
+jj extract
+```
+
+Then describe that change, reading its diff first:
+
+```bash
+jj show <change-id>
+jj describe -r <change-id> -m "<what changed and why>"
 ```
 
 Use the printed change id for review or handoff. Extracted session changes stay
@@ -27,6 +34,8 @@ a separate branch for the session.
 - Edit normally; recording is automatic for Codex `apply_patch` and supported
   Claude Code file tools.
 - Run `jj extract` after a coherent chunk of work, before handing it off.
+- Describe the extracted change with `jj describe`. `jj extract` takes no `-m`
+  and writes no description of its own; it never overwrites one already there.
 - Use `jj extract --all` only when intentionally collecting every recorded
   session.
 - Preserve the live working-copy change. Attributed edits move into the stack;

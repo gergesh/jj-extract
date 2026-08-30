@@ -58,10 +58,11 @@ const LEDGER_ATTRIBUTE: &str = "jj-extract.extractions";
 /// builds a change of its own there.
 type Ledger = BTreeMap<String, Vec<String>>;
 
-fn extraction_desc(session: &str, message: Option<&str>, kind: Option<&str>) -> String {
-    let body = message
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("jj-extract: {session}"));
+/// The description a *newly* built change starts with: a placeholder naming the
+/// session, for the author to replace with `jj describe` once they can see what
+/// the change contains. Extraction deliberately writes no prose of its own.
+fn extraction_desc(session: &str, kind: Option<&str>) -> String {
+    let body = format!("jj-extract: {session}");
     // The standard trailer each agent already writes for its own commits, so
     // existing co-authorship tooling reads an extracted change unaided.
     match kind.and_then(identity::coauthor) {
@@ -116,7 +117,7 @@ pub fn extract(
     root: &Path,
     jj: &Jj,
     evolog: &[Evolution],
-    targets: &[(String, Option<String>)],
+    targets: &[String],
 ) -> Result<Vec<Built>, String> {
     let sessions = agents_in(evolog);
     let settings = jj.settings(
@@ -138,7 +139,7 @@ pub fn extract(
 async fn extract_async(
     root: &Path,
     evolog: &[Evolution],
-    targets: &[(String, Option<String>)],
+    targets: &[String],
     sessions: &[String],
     user_name: &str,
     user_email: &str,
@@ -184,14 +185,10 @@ async fn extract_async(
     let mut ledger = read_ledger(repo.as_ref()).await?;
     let mut existing = existing_extractions(repo.as_ref(), &base, sessions, &ledger).await?;
 
-    let target_messages: HashMap<&str, Option<&str>> = targets
-        .iter()
-        .map(|(session, message)| (session.as_str(), message.as_deref()))
-        .collect();
     let mut target_trees = HashMap::new();
-    for session in target_messages.keys() {
+    for session in targets {
         if let Some(tree) = compose_session_tree(store, &base, session, evolog).await? {
-            target_trees.insert((*session).to_string(), tree);
+            target_trees.insert(session.clone(), tree);
         }
     }
     if target_trees.is_empty() {
@@ -212,11 +209,16 @@ async fn extract_async(
                 (
                     base.tree(),
                     tree.clone(),
-                    extraction_desc(
-                        session,
-                        target_messages[session.as_str()],
-                        kind_of(evolog, session).as_deref(),
-                    ),
+                    // A change that already has a description keeps it:
+                    // re-extraction updates what the change contains, never the
+                    // words its author chose for it.
+                    prior
+                        .as_ref()
+                        .map(|commit| commit.description().to_owned())
+                        .filter(|description| !description.is_empty())
+                        .unwrap_or_else(|| {
+                            extraction_desc(session, kind_of(evolog, session).as_deref())
+                        }),
                     true,
                 )
             } else if let Some(commit) = &prior {
