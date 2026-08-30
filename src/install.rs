@@ -45,12 +45,12 @@ fn merge_settings(
 ) -> std::io::Result<bool> {
     let mut data = read_settings(path)?;
     validate_settings(&data)?;
+    let original = data.clone();
     let hooks = data
         .as_object_mut()
         .expect("validated settings object")
         .entry("hooks")
         .or_insert_with(|| json!({}));
-    let mut changed = false;
 
     for &(event, matcher) in registrations {
         let groups = hooks
@@ -59,7 +59,9 @@ fn merge_settings(
             .entry(event)
             .or_insert_with(|| json!([]));
         let arr = groups.as_array_mut().expect("validated hook groups");
-        // Find a group with the same matcher.
+        // Drop any registration we left behind before, whatever matcher it
+        // used, so this event ends up with exactly one of our hooks.
+        strip_our_hooks(arr);
         let existing = arr.iter_mut().find(|grp| group_matches(grp, matcher));
         if let Some(grp) = existing {
             let entry = grp
@@ -68,16 +70,7 @@ fn merge_settings(
                 .entry("hooks")
                 .or_insert_with(|| json!([]));
             let list = entry.as_array_mut().expect("validated hook entries");
-            let present = list.iter().any(|h| {
-                h.get("command")
-                    .and_then(Value::as_str)
-                    .map(is_our_hook)
-                    .unwrap_or(false)
-            });
-            if !present {
-                list.push(json!({"type": "command", "command": command}));
-                changed = true;
-            }
+            list.push(json!({"type": "command", "command": command}));
         } else {
             let mut grp = serde_json::Map::new();
             if let Some(m) = matcher {
@@ -88,14 +81,39 @@ fn merge_settings(
                 json!([{"type": "command", "command": command}]),
             );
             arr.push(Value::Object(grp));
-            changed = true;
         }
     }
 
+    // An install that changes nothing must leave the file — and its backup —
+    // alone, so this compares the result rather than tracking edits.
+    let changed = data != original;
     if changed {
         write_with_backup(path, &data)?;
     }
     Ok(changed)
+}
+
+/// Remove our hook from every group, dropping a group it leaves empty.
+///
+/// A release that registers a different matcher than the installed one would
+/// otherwise leave both entries in place, and every tool call would run the
+/// hook twice: two PreToolUse processes racing for the edit lock, the second
+/// stalling the tool until it decides the first holder is dead.
+fn strip_our_hooks(groups: &mut Vec<Value>) {
+    groups.retain_mut(|grp| {
+        let Some(list) = grp.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        let before = list.len();
+        list.retain(|hook| {
+            !hook
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(is_our_hook)
+        });
+        // Keep every group but the ones we just emptied.
+        before == list.len() || !list.is_empty()
+    });
 }
 
 /// Remove our hooks, leaving other hooks intact. Returns how many were removed.
@@ -257,6 +275,46 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn install_replaces_a_registration_left_by_an_earlier_matcher() {
+        let dir = test_dir();
+        let path = dir.join("settings.json");
+        // What an earlier release installed, before Bash calls were hooked.
+        fs::write(
+            &path,
+            r#"{"hooks": {"PreToolUse": [
+                 {"matcher": "Edit|Write|MultiEdit",
+                  "hooks": [{"type": "command", "command": "jj-extract --hook"}]},
+                 {"matcher": "Bash",
+                  "hooks": [{"type": "command", "command": "check"},
+                            {"type": "command", "command": "jj-extract --hook"}]}
+               ]}}"#,
+        )
+        .unwrap();
+
+        assert!(merge_claude_settings(&path, "jj-extract --hook").unwrap());
+
+        let installed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let groups = installed["hooks"]["PreToolUse"].as_array().unwrap();
+        let ours: Vec<_> = groups
+            .iter()
+            .filter(|group| {
+                group["hooks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|hook| hook["command"] == "jj-extract --hook")
+            })
+            .collect();
+        assert_eq!(ours.len(), 1, "one tool call must run the hook once");
+        assert_eq!(ours[0]["matcher"], "Edit|Write|MultiEdit|Bash");
+        // The unrelated hook that shared a group with the stale entry survives.
+        assert!(groups.iter().any(|group| {
+            group["matcher"] == "Bash" && group["hooks"][0]["command"] == "check"
+        }));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
