@@ -1,5 +1,9 @@
 //! Who is "me"? An agent is identified by `$JJ_EXTRACT_AGENT` (set per-process
 //! for deliberately named agents), Claude's session id, or Codex's thread id.
+//!
+//! A session also has a *kind* — which agent product recorded the edit. It is
+//! recorded with the snapshot so an extracted change can carry that product's
+//! own co-author trailer instead of a marker invented here.
 
 pub const ENV_VAR: &str = "JJ_EXTRACT_AGENT";
 /// Claude Code exports this for every session; it equals the hook payload's
@@ -8,6 +12,29 @@ pub const SESSION_ENV_VAR: &str = "CLAUDE_CODE_SESSION_ID";
 /// Codex exports the current hook `session_id` to tool processes under this
 /// name, so `jj extract` can resolve the same identity used for snapshots.
 pub const CODEX_SESSION_ENV_VAR: &str = "CODEX_THREAD_ID";
+
+pub const CLAUDE: &str = "claude";
+pub const CODEX: &str = "codex";
+
+/// Which product's file tool this is, or None for one we don't recognize.
+pub fn kind_of_tool(tool: &str) -> Option<&'static str> {
+    match tool {
+        "Edit" | "Write" | "MultiEdit" => Some(CLAUDE),
+        "apply_patch" => Some(CODEX),
+        _ => None,
+    }
+}
+
+/// The identity each product's own tooling names in its `Co-authored-by:`
+/// trailer. A session of unknown kind gets none: co-authorship is a claim about
+/// who wrote the code, not a guess.
+pub fn coauthor(kind: &str) -> Option<&'static str> {
+    match kind {
+        CLAUDE => Some("Claude <noreply@anthropic.com>"),
+        CODEX => Some("Codex <noreply@openai.com>"),
+        _ => None,
+    }
+}
 
 /// Resolve the acting agent from a hook payload's `session_id`, letting an
 /// explicit `$JJ_EXTRACT_AGENT` win.

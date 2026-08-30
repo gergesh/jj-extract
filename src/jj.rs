@@ -23,11 +23,17 @@ pub struct Jj {
     root: PathBuf,
 }
 
+/// Attribute naming the agent product that recorded a snapshot, so extraction
+/// can write that product's own co-author trailer.
+const KIND_ATTRIBUTE: &str = "jj-extract.agent-kind";
+
 /// One evolution of `@`: its commit id and the username on the operation that
 /// created it (i.e. the agent we tagged, or a neutral default).
 pub struct Evolution {
     pub commit: String,
     pub user: String,
+    /// Which agent product recorded it, when the hook knew.
+    pub kind: Option<String>,
     /// Whether jj marked this evolution as a pure working-copy snapshot.
     pub is_snapshot: bool,
 }
@@ -46,20 +52,21 @@ impl Jj {
     /// Snapshot the working copy under a neutral operation so edits already on
     /// disk cannot be attributed to the next agent.
     pub fn snapshot_neutral(&self) {
-        let _ = pollster::block_on(self.snapshot(None, &[]));
+        let _ = pollster::block_on(self.snapshot(None, None, &[]));
     }
 
     /// Snapshot the working copy in an operation owned by `agent`. Every tracked
     /// path is snapshotted by jj's working-copy implementation; the named paths
     /// (the files this edit created) are the only ones allowed to *start* being
     /// tracked, so editing an untracked file never pulls it into the repo.
-    pub fn snapshot_tagged(&self, agent: &str, paths: &[String]) {
-        let _ = pollster::block_on(self.snapshot(Some(agent), paths));
+    pub fn snapshot_tagged(&self, agent: &str, kind: Option<&str>, paths: &[String]) {
+        let _ = pollster::block_on(self.snapshot(Some(agent), kind, paths));
     }
 
     async fn snapshot(
         &self,
         operation_username: Option<&str>,
+        kind: Option<&str>,
         paths: &[String],
     ) -> Result<(), String> {
         let settings = settings(&self.root, operation_username)?;
@@ -124,6 +131,9 @@ impl Jj {
         let mut tx = repo.start_transaction();
         tx.set_is_snapshot(true);
         tx.set_workspace_name(&workspace_name);
+        if let Some(kind) = kind {
+            tx.set_attribute(KIND_ATTRIBUTE.to_string(), kind.to_string());
+        }
         let new_wc = tx
             .repo_mut()
             .rewrite_commit(&wc_commit)
@@ -182,6 +192,11 @@ impl Jj {
                     .map(|op| op.metadata().username.clone())
                     .filter(|user| !user.is_empty())
                     .unwrap_or_else(|| neutral.to_string()),
+                kind: entry
+                    .operation
+                    .as_ref()
+                    .and_then(|op| op.metadata().attributes.get(KIND_ATTRIBUTE))
+                    .cloned(),
                 is_snapshot: entry
                     .operation
                     .as_ref()

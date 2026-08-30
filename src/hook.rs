@@ -24,7 +24,7 @@ use serde_json::Value;
 use std::io::Read;
 use std::path::Path;
 
-use crate::identity::{from_payload, ENV_VAR};
+use crate::identity::{self, from_payload, ENV_VAR};
 use crate::jj::Jj;
 use crate::new_files;
 use crate::paths::{central_root, find_repo_root, relpath_within};
@@ -108,7 +108,7 @@ fn dispatch(payload: &Value) {
     // snapshot always covers every tracked file; the paths only say what may
     // *become* tracked, so an edit to an untracked file leaves it untracked.
     let created = new_files::take(&state_dir, &agent);
-    jj.snapshot_tagged(&agent, &created);
+    jj.snapshot_tagged(&agent, identity::kind_of_tool(tool), &created);
     crate::lock::release(&state_dir, &agent);
 }
 

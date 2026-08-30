@@ -111,6 +111,16 @@ If an older jj-extract release already left session changes as sibling heads,
 the next extraction linearizes those owned changes while preserving their change
 IDs.
 
+An extracted change is credited with the standard `Co-authored-by:` trailer the
+session's own agent writes — `Claude <noreply@anthropic.com>` for Claude Code,
+`Codex <noreply@openai.com>` for Codex — and nothing else. Which session a
+change was built for is recorded in the extraction operation's own metadata, not
+in the description, so `jj describe` is free to replace the text entirely: the
+next extraction still updates the same change. That ledger is written to the
+operation log, so it survives every rewrite of the change but not a discarded
+operation history; an extraction whose ledger entry is gone builds a new change
+rather than updating the old one.
+
 Re-extraction updates an existing session change only on the same stable
 extraction base. The same session extracted from another branch line receives a
 distinct change ID instead of rewriting the earlier line.
@@ -123,9 +133,9 @@ normal jj conflict resolution.
 
 ```text
 PreToolUse                         PostToolUse
-  acquire repository edit lock      snapshot with the session as jj's op user
-  note which targets don't exist     release the edit lock
-  neutral jj-lib snapshot
+  acquire repository edit lock      snapshot as the session, tagged with
+  note which targets don't exist     its agent in the operation metadata
+  neutral jj-lib snapshot           release the edit lock
   allow the file tool to run
 
 `jj extract`

@@ -59,8 +59,13 @@ has() { addedlines "$1" | grep -q "$2"; }
 nothas() { ! addedlines "$1" | grep -q "$2"; }
 # One-session extract, echoing just the built change id.
 extract_one() { "$BIN" 2>&1 | grep "session $1 " | grep -oE 'change [0-9a-z]+' | head -1 | awk '{print $2}'; }
-# How many extracted changes carry a given session's trailer.
-n_extractions() { jj log -r "description(substring:\"jj-extract-session: $1\")" --no-graph -T 'change_id.short() ++ "\n"' 2>/dev/null | grep -c .; }
+# How many extracted changes a session has. Extraction identifies its own
+# changes through the operation-log ledger, not the description, so this counts
+# the default description these fixtures never rewrite.
+n_extractions() { jj log -r "description(substring:\"jj-extract: $1\")" --no-graph -T 'change_id.short() ++ "\n"' 2>/dev/null | grep -c .; }
+# Every visible commit except the root, to catch a duplicate change.
+n_commits() { jj log -r 'all() ~ root()' --no-graph -T '"X\n"' 2>/dev/null | grep -c X; }
+desc() { jj log -r "$1" --no-graph -T description 2>/dev/null; }
 n_divergent() { jj log -r 'all()' --no-graph -T 'if(divergent,"X","")' 2>/dev/null | grep -c X; }
 n_heads() { jj log -r 'heads(all()) ~ root()' --no-graph -T '"X\n"' 2>/dev/null | grep -c X; }
 is_conflict() { [ "$(jj log -r "$1" --no-graph -T 'if(conflict,"yes","no")' 2>/dev/null)" = yes ]; }
@@ -246,7 +251,7 @@ edit a1 f.txt $'l1\nl2\nl3\nFIRST\n'
 A1_ID="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
 edit a2 f.txt $'l1\nl2\nl3\nFIRST\nSECOND\n'
 A2_ID="$(JJ_EXTRACT_AGENT=a2 extract_one a2)"
-CURRENT_A1_ID="$(jj log -r 'description(substring:"jj-extract-session: a1")' --no-graph -T 'change_id.short()')"
+CURRENT_A1_ID="$(jj log -r 'description(substring:"jj-extract: a1")' --no-graph -T 'change_id.short()')"
 ok "independent extracts preserve both session changes" \
   "[ \"$(n_extractions a1)\" = 1 ] && [ \"$(n_extractions a2)\" = 1 ]"
 ok "the later independent extract owns only its edit" \
@@ -268,8 +273,8 @@ jj rebase -r "$LEGACY_A2" -d "$LEGACY_BASE" >/dev/null 2>&1
 jj rebase -r @ -d "$LEGACY_BASE" >/dev/null 2>&1
 ok "legacy fixture has one live and two sibling heads" "[ \"$(n_heads)\" = 3 ]"
 JJ_EXTRACT_AGENT=a1 "$BIN" >/dev/null 2>&1
-CURRENT_A1_ID="$(jj log -r 'description(substring:"jj-extract-session: a1")' --no-graph -T 'change_id.short()')"
-CURRENT_A2_ID="$(jj log -r 'description(substring:"jj-extract-session: a2")' --no-graph -T 'change_id.short()')"
+CURRENT_A1_ID="$(jj log -r 'description(substring:"jj-extract: a1")' --no-graph -T 'change_id.short()')"
+CURRENT_A2_ID="$(jj log -r 'description(substring:"jj-extract: a2")' --no-graph -T 'change_id.short()')"
 ok "next extraction collapses legacy siblings to one head" \
   "[ \"$(n_heads)\" = 1 ] && [ \"$(n_divergent)\" = 0 ]"
 ok "legacy extracted change identities survive linearization" \
@@ -323,7 +328,7 @@ ok "re-extraction is one operation" "[ \"$(op_parent)\" = '$OP_BEFORE_SECOND' ]"
 ok "re-extraction preserves the extracted change id" "[ -n '$ID1' ] && [ '$ID1' = '$ID2' ]"
 ok "re-extraction includes old and new edits" "has '$ID2' ONE && has '$ID2' TOP"
 jj undo >/dev/null 2>&1
-CURRENT_A1_ID="$(jj log -r 'description(substring:"jj-extract-session: a1")' --no-graph -T 'change_id.short()')"
+CURRENT_A1_ID="$(jj log -r 'description(substring:"jj-extract: a1")' --no-graph -T 'change_id.short()')"
 ok "undo restores the prior extracted content" \
   "[ '$CURRENT_A1_ID' = '$ID1' ] && has '$CURRENT_A1_ID' ONE && nothas '$CURRENT_A1_ID' TOP"
 ok "undo returns the later edit to live @" "echo \"\$(jj diff -r @ --git)\" | grep -q TOP"
@@ -369,6 +374,29 @@ ok "an edited untracked file stays untracked" \
   "! jj file list -r @ 2>/dev/null | grep -q untracked.txt"
 ok "a file the agent created is tracked and extracted" \
   "has '$(cid a1)' AGENT-CREATED && jj file list -r @ 2>/dev/null | grep -q created.txt"
+
+echo "== S: extracted changes carry each agent's standard co-author trailer =="
+new_repo s
+edit a1 f.txt $'l1\nl2\nl3\nCLAUDE-EDIT\n'
+codex_edit c1 f.txt $'l1\nl2\nl3\nCLAUDE-EDIT\nCODEX-EDIT\n'
+extract_all
+ok "a Claude session is credited the standard way" \
+  "desc '$(cid a1)' | grep -q '^Co-authored-by: Claude <noreply@anthropic.com>$'"
+ok "a Codex session is credited the standard way" \
+  "desc '$(cid c1)' | grep -q '^Co-authored-by: Codex <noreply@openai.com>$'"
+ok "no private session trailer is written" \
+  "! desc '$(cid a1)' | grep -q 'jj-extract-session'"
+
+echo "== T: re-extraction finds its change through a rewritten description =="
+new_repo t
+edit a1 f.txt $'l1\nl2\nl3\nONE\n'
+ID1="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
+jj describe -r "$ID1" -m 'entirely my own words' >/dev/null 2>&1
+edit a1 f.txt $'TOP\nl1\nl2\nl3\nONE\n'
+ID2="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
+ok "a re-described change is still updated in place" "[ -n '$ID1' ] && [ '$ID1' = '$ID2' ]"
+ok "re-extraction creates no duplicate change"       "[ \"$(n_commits)\" = 3 ]"
+ok "the update carries both edits"                   "has '$ID2' ONE && has '$ID2' TOP"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

@@ -8,7 +8,7 @@
 //! log as the attribution ledger while making one `jj undo` reverse a complete
 //! extraction.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,13 +22,17 @@ use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
-use jj_lib::repo::Repo as _;
+use jj_lib::object_id::ObjectId as _;
+use jj_lib::op_walk;
+use jj_lib::operation::Operation;
+use jj_lib::repo::{ReadonlyRepo, Repo as _};
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::revset::{RevsetExpression, RevsetStreamExt as _};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::workspace::Workspace;
 
+use crate::identity;
 use crate::jj::{Evolution, Jj};
 
 pub struct Built {
@@ -39,16 +43,61 @@ pub struct Built {
     pub updated: bool,
 }
 
-/// A stable, machine-readable trailer identifying the owning session.
-pub fn session_trailer(session: &str) -> String {
-    format!("jj-extract-session: {session}")
-}
+/// Operation attribute holding this tool's session -> extracted changes ledger.
+///
+/// The mapping lives in the extraction operation's own metadata rather than in
+/// a commit description. A description belongs to whoever writes it: the moment
+/// someone runs `jj describe`, machine state kept there is gone, and until then
+/// it is noise in every log, blame and pull request. jj's operation log is
+/// already this tool's ledger, and it survives the rewrites that extraction and
+/// re-description perform on the change itself.
+const LEDGER_ATTRIBUTE: &str = "jj-extract.extractions";
 
-fn extraction_desc(session: &str, message: Option<&str>) -> String {
+/// Session -> the changes extracted for it, newest last. A session can hold
+/// more than one: extracting the same session from a different branch line
+/// builds a change of its own there.
+type Ledger = BTreeMap<String, Vec<String>>;
+
+fn extraction_desc(session: &str, message: Option<&str>, kind: Option<&str>) -> String {
     let body = message
         .map(str::to_owned)
         .unwrap_or_else(|| format!("jj-extract: {session}"));
-    format!("{body}\n\n{}", session_trailer(session))
+    // The standard trailer each agent already writes for its own commits, so
+    // existing co-authorship tooling reads an extracted change unaided.
+    match kind.and_then(identity::coauthor) {
+        Some(coauthor) => format!("{body}\n\nCo-authored-by: {coauthor}"),
+        None => body,
+    }
+}
+
+/// The agent product behind `session`, from the first of its evolutions that
+/// recorded one.
+fn kind_of(evolog: &[Evolution], session: &str) -> Option<String> {
+    evolog
+        .iter()
+        .find(|evolution| evolution.user == session && evolution.kind.is_some())
+        .and_then(|evolution| evolution.kind.clone())
+}
+
+/// The newest ledger this tool published, found by walking back through its own
+/// operations. Absent (or unreadable, which can only mean a version wrote a
+/// shape this one doesn't know) it starts empty: extraction then builds a fresh
+/// change instead of updating one, which is the same outcome as a first run.
+async fn read_ledger(repo: &ReadonlyRepo) -> Result<Ledger, String> {
+    use futures::TryStreamExt as _;
+
+    let head: Operation = repo.operation().clone();
+    let mut operations = Box::pin(op_walk::walk_ancestors(&[head]));
+    while let Some(operation) = operations
+        .try_next()
+        .await
+        .map_err(|e| format!("could not read the operation log: {e}"))?
+    {
+        if let Some(raw) = operation.metadata().attributes.get(LEDGER_ATTRIBUTE) {
+            return Ok(serde_json::from_str(raw).unwrap_or_default());
+        }
+    }
+    Ok(Ledger::new())
 }
 
 /// Agents present in the evolog, in first-edit order.
@@ -132,7 +181,8 @@ async fn extract_async(
         .get_commit(&base_id)
         .map_err(|e| format!("could not load the extraction base: {e}"))?;
 
-    let mut existing = existing_extractions(repo.as_ref(), &base, sessions).await?;
+    let mut ledger = read_ledger(repo.as_ref()).await?;
+    let mut existing = existing_extractions(repo.as_ref(), &base, sessions, &ledger).await?;
 
     let target_messages: HashMap<&str, Option<&str>> = targets
         .iter()
@@ -162,7 +212,11 @@ async fn extract_async(
                 (
                     base.tree(),
                     tree.clone(),
-                    extraction_desc(session, target_messages[session.as_str()]),
+                    extraction_desc(
+                        session,
+                        target_messages[session.as_str()],
+                        kind_of(evolog, session).as_deref(),
+                    ),
                     true,
                 )
             } else if let Some(commit) = &prior {
@@ -205,6 +259,11 @@ async fn extract_async(
             }
         }
         if is_target {
+            let extracted = ledger.entry(session.clone()).or_default();
+            let change = commit.change_id().hex();
+            if !extracted.contains(&change) {
+                extracted.push(change);
+            }
             built.push(Built {
                 session: session.clone(),
                 change_id: short_hex(commit.change_id().reverse_hex()),
@@ -233,6 +292,11 @@ async fn extract_async(
         .await
         .map_err(|e| format!("could not rebase descendants of extracted changes: {e}"))?;
 
+    tx.set_attribute(
+        LEDGER_ATTRIBUTE.to_string(),
+        serde_json::to_string(&ledger)
+            .map_err(|e| format!("could not write the extraction ledger: {e}"))?,
+    );
     let operation_description = if built.len() == 1 {
         format!("extract session {}", built[0].session)
     } else {
@@ -258,10 +322,14 @@ async fn extract_async(
     Ok(built)
 }
 
+/// The changes a previous extraction built for `sessions`, restricted to this
+/// working-copy line. The ledger names them by change id, which survives every
+/// rewrite extraction performs — and every `jj describe` the user performs.
 async fn existing_extractions(
     repo: &dyn jj_lib::repo::Repo,
     base: &Commit,
     sessions: &[String],
+    ledger: &Ledger,
 ) -> Result<HashMap<String, Vec<Commit>>, String> {
     use futures::TryStreamExt as _;
 
@@ -282,8 +350,12 @@ async fn existing_extractions(
 
     let mut existing: HashMap<String, Vec<Commit>> = HashMap::new();
     for commit in commits {
+        let change = commit.change_id().hex();
         for session in sessions {
-            if commit.description().contains(&session_trailer(session)) {
+            if ledger
+                .get(session)
+                .is_some_and(|changes| changes.contains(&change))
+            {
                 existing
                     .entry(session.clone())
                     .or_default()
