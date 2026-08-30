@@ -153,7 +153,7 @@ fn session_start(payload: &Value) {
     //
     // $CLAUDE_ENV_FILE is *sourced* as a shell prefix, so the line MUST say
     // `export` — a bare `KEY=VALUE` sets an unexported shell var that never reaches
-    // the `jj-extract` subprocess `jj extract` spawns via `jj util exec`. (Even so,
+    // the `jj-extract` process `jj extract` starts via `jj util exec`. (Even so,
     // `from_cli` falls back to the always-exported $CLAUDE_CODE_SESSION_ID.)
     if std::env::var(ENV_VAR)
         .map(|v| !v.is_empty())

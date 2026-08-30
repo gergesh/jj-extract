@@ -1,46 +1,27 @@
-//! Thin wrappers over the `jj` CLI. Two roles:
-//!
-//! * **Record** (hooks): each edit is captured as a working-copy snapshot whose
-//!   *operation* is tagged with the acting agent (`JJ_OP_USERNAME`). jj's evolog
-//!   then carries the attribution itself — `jj evolog -r @` lists every
-//!   evolution of `@` with the operation (and thus agent) that made it. No
-//!   sidecar: the op log is the ledger.
-//! * **Construct** (harvest): read the evolog, and for each of an agent's
-//!   evolutions replay `diff(previous, this)` as a delta commit rebased onto
-//!   base, letting jj's 3-way merge compose the agent's edits.
+//! Direct `jj-lib` access for recording and reading attributed edits.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use futures::TryStreamExt as _;
+use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::default_backend_factories::{
+    default_backend_factories, default_working_copy_factories,
+};
+use jj_lib::evolution::walk_predecessors;
+use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::matchers::{FilesMatcher, NothingMatcher};
+use jj_lib::object_id::ObjectId as _;
+use jj_lib::repo::Repo as _;
+use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::revset::{RevsetExpression, RevsetStreamExt as _};
+use jj_lib::settings::{HumanByteSize, UserSettings};
+use jj_lib::working_copy::SnapshotOptions;
+use jj_lib::workspace::Workspace;
+
+use crate::jj_config::config_home;
 
 pub struct Jj {
     root: PathBuf,
-}
-
-pub struct Run {
-    pub ok: bool,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-impl Run {
-    /// Turn a failed jj invocation into an actionable error while preserving the
-    /// successful result for callers that need its output.
-    pub fn require(self, context: &str) -> Result<Run, String> {
-        if self.ok {
-            return Ok(self);
-        }
-        let detail = self.stderr.trim();
-        let detail = if detail.is_empty() {
-            self.stdout.trim()
-        } else {
-            detail
-        };
-        if detail.is_empty() {
-            Err(format!("{context}: jj exited unsuccessfully"))
-        } else {
-            Err(format!("{context}: {detail}"))
-        }
-    }
 }
 
 /// One evolution of `@`: its commit id and the username on the operation that
@@ -57,218 +38,330 @@ impl Jj {
         }
     }
 
-    fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> Run {
-        let mut cmd = Command::new("jj");
-        cmd.args(args)
-            .current_dir(&self.root)
-            .env("JJ_EDITOR", "true");
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        match cmd.output() {
-            Ok(o) => Run {
-                ok: o.status.success(),
-                stdout: String::from_utf8_lossy(&o.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&o.stderr).to_string(),
-            },
-            Err(e) => Run {
-                ok: false,
-                stdout: String::new(),
-                stderr: e.to_string(),
-            },
-        }
+    pub fn settings(&self, operation_username: &str) -> Result<UserSettings, String> {
+        settings(&self.root, Some(operation_username))
     }
 
-    pub fn run(&self, args: &[&str]) -> Run {
-        self.run_env(args, &[])
-    }
-
-    // --- record --------------------------------------------------------------
-
-    /// Snapshot the working copy under a *neutral* operation (default user), so
-    /// whatever is on disk right now — a Bash/human/peer change — becomes an
-    /// unattributed evolution and won't fold into the next agent's edit.
+    /// Snapshot the working copy under a neutral operation so edits already on
+    /// disk cannot be attributed to the next agent.
     pub fn snapshot_neutral(&self) {
-        let _ = self.run(&["status"]);
+        let _ = pollster::block_on(self.snapshot(None, &[]));
     }
 
-    /// Snapshot the working copy under an operation tagged with `agent`, so this
-    /// becomes the agent's evolution in the evolog.
-    ///
-    /// A plain `jj status` tags the snapshot op correctly but won't pick up a
-    /// newly-created file (`auto-track=none`); `jj file track` picks it up but
-    /// does the content snapshot in a *separate untagged* op. So we snapshot with
-    /// `snapshot.auto-track` scoped to the edited file — that both tracks it and
-    /// tags the snapshot. One snapshot per file (edits are ~always single-file);
-    /// each is a tagged evolution, and the builder composes them.
+    /// Snapshot the working copy in an operation owned by `agent`. Only the
+    /// named paths are eligible to become newly tracked; tracked paths are
+    /// always snapshotted by jj's working-copy implementation.
     pub fn snapshot_tagged(&self, agent: &str, paths: &[String]) {
-        let env = [("JJ_OP_USERNAME", agent)];
-        let existing: Vec<&str> = paths
-            .iter()
-            .filter(|p| self.root.join(p).exists())
-            .map(|s| s.as_str())
-            .collect();
-        if existing.is_empty() {
-            let _ = self.run_env(&["status"], &env);
-            return;
-        }
-        for p in existing {
-            // `{:?}` quotes the path; jj reads the --config value as the fileset
-            // to auto-track for this snapshot (unrelated untracked files stay out).
-            let cfg = format!("snapshot.auto-track={p:?}");
-            let _ = self.run_env(&["--config", &cfg, "status"], &env);
-        }
+        let _ = pollster::block_on(self.snapshot(Some(agent), paths));
     }
 
-    // --- construct -----------------------------------------------------------
+    async fn snapshot(
+        &self,
+        operation_username: Option<&str>,
+        paths: &[String],
+    ) -> Result<(), String> {
+        let settings = settings(&self.root, operation_username)?;
+        let mut workspace = self.load_workspace(&settings)?;
+        let repo = workspace
+            .repo_loader()
+            .load_at_head()
+            .await
+            .map_err(|e| format!("could not load the jj repository: {e}"))?;
+        let workspace_name = workspace.workspace_name().to_owned();
+        let wc_id = repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .cloned()
+            .ok_or_else(|| "could not resolve the working-copy commit".to_string())?;
+        let wc_commit = repo
+            .store()
+            .get_commit(&wc_id)
+            .map_err(|e| format!("could not load the working-copy commit: {e}"))?;
+
+        let repo_paths = paths
+            .iter()
+            .filter(|path| self.root.join(path).exists())
+            .map(|path| RepoPathBuf::from_internal_string(path.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("invalid repository path in hook payload: {e}"))?;
+        let files = FilesMatcher::new(&repo_paths);
+        let nothing = NothingMatcher;
+        let start_tracking = if repo_paths.is_empty() {
+            &nothing as &dyn jj_lib::matchers::Matcher
+        } else {
+            &files as &dyn jj_lib::matchers::Matcher
+        };
+        let options = SnapshotOptions {
+            base_ignores: GitIgnoreFile::empty(),
+            progress: None,
+            start_tracking_matcher: start_tracking,
+            force_tracking_matcher: &nothing,
+            max_new_file_size: max_new_file_size(&settings),
+        };
+
+        let mut locked = workspace
+            .start_working_copy_mutation()
+            .await
+            .map_err(|e| format!("could not lock the jj working copy: {e}"))?;
+        if locked.locked_wc().old_operation_id() != repo.op_id() {
+            return Err("the jj working copy changed while preparing its snapshot".to_string());
+        }
+        let (new_tree, _stats) = locked
+            .locked_wc()
+            .snapshot(&options)
+            .await
+            .map_err(|e| format!("could not snapshot the jj working copy: {e}"))?;
+        if new_tree.tree_ids_and_labels() == wc_commit.tree().tree_ids_and_labels() {
+            locked
+                .finish(repo.op_id().clone())
+                .await
+                .map_err(|e| format!("could not save the jj working-copy state: {e}"))?;
+            return Ok(());
+        }
+
+        let mut tx = repo.start_transaction();
+        tx.set_is_snapshot(true);
+        tx.set_workspace_name(&workspace_name);
+        let new_wc = tx
+            .repo_mut()
+            .rewrite_commit(&wc_commit)
+            .set_tree(new_tree)
+            .write()
+            .await
+            .map_err(|e| format!("could not write the working-copy snapshot: {e}"))?;
+        tx.repo_mut()
+            .set_wc_commit(workspace_name, new_wc.id().clone())
+            .map_err(|e| format!("could not update the working-copy commit: {e}"))?;
+        tx.repo_mut()
+            .rebase_descendants()
+            .await
+            .map_err(|e| format!("could not rebase after the working-copy snapshot: {e}"))?;
+        let new_repo = tx
+            .commit("snapshot working copy")
+            .await
+            .map_err(|e| format!("could not publish the working-copy snapshot: {e}"))?;
+        locked
+            .finish(new_repo.op_id().clone())
+            .await
+            .map_err(|e| format!("could not save the jj working-copy state: {e}"))?;
+        Ok(())
+    }
 
     /// `@`'s evolutions, oldest first, each with the tagging operation's user.
     pub fn evolog(&self) -> Result<Vec<Evolution>, String> {
-        let r = self
-            .run(&[
-                "evolog",
-                "-r",
-                "@",
-                "-T",
-                r#"commit.commit_id().short() ++ " " ++ operation.user() ++ "\n""#,
-                "--no-graph",
-            ])
-            .require("could not read the working-copy evolution log")?;
-        let mut evos: Vec<Evolution> = r
-            .stdout
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(parse_evolution)
-            .collect::<Result<_, _>>()?;
-        evos.reverse(); // evolog is newest-first; we want chronological
-        Ok(evos)
+        pollster::block_on(self.evolog_async())
     }
 
-    /// Create a throwaway change without moving the working copy, then return
-    /// its id. The unique description lets us identify the new change without
-    /// parsing jj's human-oriented command output.
-    pub fn new_no_edit(&self, parent: &str, marker: &str) -> Result<String, String> {
-        self.run(&["new", "--no-edit", "-m", marker, parent])
-            .require("could not create a temporary extraction change")?;
-        self.changes_with_description(marker)?
+    async fn evolog_async(&self) -> Result<Vec<Evolution>, String> {
+        let neutral = "jj-extract";
+        let settings = settings(&self.root, None)?;
+        let workspace = self.load_workspace(&settings)?;
+        let repo = workspace
+            .repo_loader()
+            .load_at_head()
+            .await
+            .map_err(|e| format!("could not load the jj repository: {e}"))?;
+        let wc_id = repo
+            .view()
+            .get_wc_commit_id(workspace.workspace_name())
+            .cloned()
+            .ok_or_else(|| "could not resolve the working-copy commit".to_string())?;
+        let mut entries: Vec<_> = walk_predecessors(&repo, &[wc_id])
+            .try_collect()
+            .await
+            .map_err(|e| format!("could not read the working-copy evolution log: {e}"))?;
+        let mut evolutions = entries
+            .drain(..)
+            .map(|entry| Evolution {
+                commit: entry.commit.id().hex(),
+                user: entry
+                    .operation
+                    .as_ref()
+                    .map(|op| op.metadata().username.clone())
+                    .filter(|user| !user.is_empty())
+                    .unwrap_or_else(|| neutral.to_string()),
+            })
+            .collect::<Vec<_>>();
+        evolutions.reverse();
+        Ok(evolutions)
+    }
+
+    /// Visible commits whose description contains `needle`.
+    pub fn commits_with_description(&self, needle: &str) -> Result<Vec<String>, String> {
+        pollster::block_on(self.commits_with_description_async(needle))
+    }
+
+    async fn commits_with_description_async(&self, needle: &str) -> Result<Vec<String>, String> {
+        let settings = settings(&self.root, None)?;
+        let workspace = self.load_workspace(&settings)?;
+        let repo = workspace
+            .repo_loader()
+            .load_at_head()
+            .await
+            .map_err(|e| format!("could not load the jj repository: {e}"))?;
+        let revset = RevsetExpression::all()
+            .evaluate(repo.as_ref())
+            .map_err(|e| format!("could not evaluate visible commits: {e}"))?;
+        let commits: Vec<_> = revset
+            .stream()
+            .commits(repo.store())
+            .try_collect()
+            .await
+            .map_err(|e| format!("could not read visible commits: {e}"))?;
+        Ok(commits
             .into_iter()
-            .next()
-            .ok_or_else(|| "jj did not return the temporary extraction change id".to_string())
-    }
-
-    /// Overwrite `into`'s tree with `from`'s (all files), preserving `into`'s
-    /// change id and description — used to update a prior extraction in place.
-    pub fn restore_into(&self, into: &str, from: &str) -> Run {
-        self.run(&["restore", "--from", from, "--into", into])
-    }
-
-    /// Change ids of visible commits whose description contains `needle`.
-    pub fn changes_with_description(&self, needle: &str) -> Result<Vec<String>, String> {
-        let pat = serde_json::to_string(needle).unwrap_or_default();
-        let revset = format!("description(substring:{pat})");
-        let r = self
-            .run(&[
-                "log",
-                "-r",
-                &revset,
-                "--no-graph",
-                "-T",
-                r#"change_id.short() ++ "\n""#,
-            ])
-            .require("could not query changes by description")?;
-        Ok(r.stdout
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .filter(|commit| commit.description().contains(needle))
+            .map(|commit| commit.id().hex())
             .collect())
     }
 
-    pub fn rebase_onto(&self, change: &str, dest: &str) -> Run {
-        self.run(&["rebase", "-r", change, "-d", dest])
-    }
-
-    pub fn squash_into(&self, from: &str, into: &str) -> Run {
-        self.run(&[
-            "squash",
-            "--from",
-            from,
-            "--into",
-            into,
-            "--use-destination-message",
-        ])
-    }
-
-    /// Restore the working copy to `rev` in place, preserving its change id (and
-    /// thus its evolog) — used to return `@` to the live state after harvest.
-    pub fn edit(&self, rev: &str) -> Run {
-        self.run(&["edit", rev])
-    }
-
-    /// Abandon `rev` (used to clean up the builder's throwaway pre-image commits).
-    pub fn abandon(&self, rev: &str) -> Run {
-        self.run(&["abandon", "-r", rev])
-    }
-
-    // --- queries -------------------------------------------------------------
-
-    pub fn change_id(&self, rev: &str) -> Option<String> {
-        let r = self.run(&["log", "-r", rev, "-T", "change_id.short()", "--no-graph"]);
-        let id = r.stdout.trim().to_string();
-        (r.ok && !id.is_empty()).then_some(id)
-    }
-
-    pub fn is_conflict(&self, rev: &str) -> Result<bool, String> {
-        let r = self
-            .run(&[
-                "log",
-                "-r",
-                rev,
-                "-T",
-                r#"if(conflict,"1","0")"#,
-                "--no-graph",
-            ])
-            .require("could not inspect the extracted change for conflicts")?;
-        Ok(r.stdout.trim() == "1")
-    }
-
-    pub fn describe(&self, rev: &str, message: &str) -> Run {
-        self.run(&["describe", "-r", rev, "-m", message])
+    fn load_workspace(&self, settings: &UserSettings) -> Result<Workspace, String> {
+        Workspace::load(
+            settings,
+            &self.root,
+            &default_backend_factories(),
+            &default_working_copy_factories(),
+        )
+        .map_err(|e| format!("could not load the jj workspace: {e}"))
     }
 }
 
-fn parse_evolution(line: &str) -> Result<Evolution, String> {
-    let (commit, operation_user) = line
-        .trim()
-        .split_once(' ')
-        .ok_or_else(|| format!("could not parse jj evolog output: {line:?}"))?;
-    // operation.user() is "name@host". Split from the right so deliberately
-    // named agents such as "team@agent" retain the complete identity.
-    let user = operation_user
-        .rsplit_once('@')
-        .map(|(name, _host)| name)
-        .unwrap_or(operation_user);
-    if commit.is_empty() || user.is_empty() {
-        return Err(format!("could not parse jj evolog output: {line:?}"));
+fn settings(root: &Path, operation_username: Option<&str>) -> Result<UserSettings, String> {
+    let neutral_username = neutral_username();
+    let mut layer = ConfigLayer::empty(ConfigSource::User);
+    layer
+        .set_value("user.name", "jj-extract")
+        .and_then(|_| layer.set_value("user.email", "jj-extract@localhost"))
+        .and_then(|_| layer.set_value("operation.username", neutral_username))
+        .and_then(|_| layer.set_value("operation.hostname", "jj-extract.local"))
+        .map_err(|e| format!("could not build jj-lib settings: {e}"))?;
+    let mut config = StackedConfig::with_defaults();
+    config.add_layer(layer);
+    load_config_files(&mut config, root)?;
+    if let Some(operation_username) = operation_username {
+        let mut overrides = ConfigLayer::empty(ConfigSource::CommandArg);
+        overrides
+            .set_value("operation.username", operation_username)
+            .map_err(|e| format!("could not build jj-lib operation settings: {e}"))?;
+        config.add_layer(overrides);
     }
-    Ok(Evolution {
-        commit: commit.to_string(),
-        user: user.to_string(),
+    UserSettings::from_config(config).map_err(|e| format!("could not load jj-lib settings: {e}"))
+}
+
+fn load_config_files(config: &mut StackedConfig, root: &Path) -> Result<(), String> {
+    if let Some(paths) = std::env::var_os("JJ_CONFIG") {
+        for path in std::env::split_paths(&paths).filter(|path| !path.as_os_str().is_empty()) {
+            load_config_path(config, ConfigSource::User, &path)?;
+        }
+    } else {
+        load_config_path(
+            config,
+            ConfigSource::System,
+            Path::new("/etc/jj/config.toml"),
+        )?;
+        load_config_path(config, ConfigSource::System, Path::new("/etc/jj/conf.d"))?;
+        if let Some(home) = dirs::home_dir() {
+            load_config_path(config, ConfigSource::User, &home.join(".jjconfig.toml"))?;
+        }
+        if let Some(config_home) = config_home() {
+            load_config_path(
+                config,
+                ConfigSource::User,
+                &config_home.join("jj/config.toml"),
+            )?;
+            load_config_path(config, ConfigSource::User, &config_home.join("jj/conf.d"))?;
+        }
+    }
+
+    let workspace_dir = root.join(".jj");
+    let repo_dir = resolve_repo_dir(&workspace_dir)?;
+    load_config_path(config, ConfigSource::Repo, &repo_dir.join("config.toml"))?;
+    if let Some(path) = secure_config_path(&repo_dir, "config-id", "repos")? {
+        load_config_path(config, ConfigSource::Repo, &path)?;
+    }
+    if let Some(path) = secure_config_path(&workspace_dir, "workspace-config-id", "workspaces")? {
+        load_config_path(config, ConfigSource::Workspace, &path)?;
+    }
+    Ok(())
+}
+
+fn load_config_path(
+    config: &mut StackedConfig,
+    source: ConfigSource,
+    path: &Path,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let result = if path.is_dir() {
+        config.load_dir(source, path)
+    } else {
+        config.load_file(source, path)
+    };
+    result.map_err(|e| format!("could not load jj config {}: {e}", path.display()))
+}
+
+fn resolve_repo_dir(workspace_dir: &Path) -> Result<PathBuf, String> {
+    let locator = workspace_dir.join("repo");
+    if locator.is_dir() {
+        return Ok(locator);
+    }
+    let value = std::fs::read_to_string(&locator).map_err(|e| {
+        format!(
+            "could not read jj repository locator {}: {e}",
+            locator.display()
+        )
+    })?;
+    let path = PathBuf::from(value.trim());
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        workspace_dir.join(path)
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_evolution;
+fn secure_config_path(
+    state_dir: &Path,
+    id_file: &str,
+    category: &str,
+) -> Result<Option<PathBuf>, String> {
+    let id_path = state_dir.join(id_file);
+    let id = match std::fs::read_to_string(&id_path) {
+        Ok(id) => id,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "could not read jj config id {}: {error}",
+                id_path.display()
+            ));
+        }
+    };
+    Ok(config_home().map(|home| {
+        home.join("jj")
+            .join(category)
+            .join(id.trim())
+            .join("config.toml")
+    }))
+}
 
-    #[test]
-    fn parses_agent_names_containing_at_signs() {
-        let evolution = parse_evolution("abc123 team@agent@workstation").unwrap();
-        assert_eq!(evolution.commit, "abc123");
-        assert_eq!(evolution.user, "team@agent");
+fn max_new_file_size(settings: &UserSettings) -> u64 {
+    let HumanByteSize(size) = settings
+        .get_value_with("snapshot.max-new-file-size", TryInto::try_into)
+        .unwrap_or(HumanByteSize(1024 * 1024));
+    if size == 0 {
+        u64::MAX
+    } else {
+        size
     }
+}
 
-    #[test]
-    fn rejects_unexpected_evolog_output() {
-        assert!(parse_evolution("missing-user").is_err());
+fn neutral_username() -> String {
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    if username.is_empty() {
+        "jj-extract".to_string()
+    } else {
+        username
     }
 }

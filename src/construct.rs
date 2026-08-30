@@ -1,200 +1,333 @@
-//! Extract: reconstruct each agent's isolated change from `@`'s evolog.
+//! Extract recorded agent edits in one jj transaction.
 //!
-//! Every evolution of `@` carries the agent that made it (the tagging op's
-//! username). An agent's change is the composition of its evolutions' deltas —
-//! for each, `diff(previous evolution, this one)` — replayed onto the base so
-//! jj's 3-way merge composes the edits. Because each edit is bracketed by a
-//! neutral pre-snapshot and taken under the edit lock, that per-evolution diff is
-//! exactly the agent's own edit, so no file scoping is needed. Single-threaded.
+//! Every attributed evolution contributes the tree delta from its predecessor
+//! to itself. We compose those deltas in memory, rewrite the extracted stack and
+//! the live working-copy commit once, then publish one operation. This keeps the
+//! operation log as the attribution ledger while making one `jj undo` reverse a
+//! complete extraction.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use jj_lib::backend::CommitId;
+use jj_lib::commit::Commit;
+use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::default_backend_factories::{
+    default_backend_factories, default_working_copy_factories,
+};
+use jj_lib::merge::Merge;
+use jj_lib::merged_tree::MergedTree;
+use jj_lib::repo::Repo as _;
+use jj_lib::settings::UserSettings;
+use jj_lib::store::Store;
+use jj_lib::workspace::Workspace;
 
 use crate::jj::{Evolution, Jj};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-static NEXT_SCAFFOLD: AtomicU64 = AtomicU64::new(0);
 
 pub struct Built {
     pub session: String,
     pub change_id: String,
     pub conflict: bool,
-    /// True when this folded into a prior extraction of the same session
-    /// (idempotent re-run) rather than minting a fresh change.
+    /// True when this updated a prior extraction of the same session.
     pub updated: bool,
 }
 
-/// A stable, machine-readable trailer line identifying which session an extracted
-/// change belongs to. It's independent of the human `-m` message, so re-running
-/// `jj extract` can find its own prior output regardless of the description.
+/// A stable, machine-readable trailer identifying the owning session.
 pub fn session_trailer(session: &str) -> String {
     format!("jj-extract-session: {session}")
 }
 
-/// The description put on an extracted change: the user's message (or a default
-/// first line) plus the [`session_trailer`] so re-runs are idempotent.
 fn extraction_desc(session: &str, message: Option<&str>) -> String {
     let body = message
-        .map(|m| m.to_string())
+        .map(str::to_owned)
         .unwrap_or_else(|| format!("jj-extract: {session}"));
     format!("{body}\n\n{}", session_trailer(session))
 }
 
-/// Fold a freshly-built change into any prior extraction of the same session so a
-/// re-run *updates in place* instead of piling up duplicates. The prior change
-/// keeps its id (and any descendants the user built on it); its content and
-/// description are replaced with the fresh build, and the fresh change (plus any
-/// extra stale duplicates) is abandoned. Returns `(surviving_change_id, updated)`.
-pub fn reconcile_idempotent(
-    jj: &Jj,
-    session: &str,
-    fresh: &str,
-    message: Option<&str>,
-) -> Result<(String, bool), String> {
-    let trailer = session_trailer(session);
-    let priors: Vec<String> = jj
-        .changes_with_description(&trailer)?
-        .into_iter()
-        .filter(|c| c != fresh)
-        .collect();
-    let existing = match priors.first().cloned() {
-        Some(e) => e,
-        None => return Ok((fresh.to_string(), false)),
-    };
-    jj.restore_into(&existing, fresh)
-        .require("could not update the previous extraction's content")?;
-    jj.describe(&existing, &extraction_desc(session, message))
-        .require("could not update the previous extraction's description")?;
-    jj.abandon(fresh)
-        .require("could not discard the temporary extracted change")?;
-    for extra in &priors[1..] {
-        jj.abandon(extra)
-            .require("could not discard a duplicate prior extraction")?;
-    }
-    Ok((existing, true))
-}
-
-/// The agents present in the evolog: every tagging user except the neutral one
-/// (the base evolution's user, used for pre-snapshots and pre-recording state).
+/// Agents present in the evolog, in first-edit order.
 pub fn agents_in(evolog: &[Evolution]) -> Vec<String> {
     let neutral = evolog.first().map(|e| e.user.as_str()).unwrap_or("");
     let mut agents = Vec::new();
-    for e in evolog {
-        if e.user != neutral && !agents.contains(&e.user) {
-            agents.push(e.user.clone());
+    for evolution in evolog {
+        if evolution.user != neutral && !agents.contains(&evolution.user) {
+            agents.push(evolution.user.clone());
         }
     }
     agents
 }
 
-/// Arrange every extracted session as a linear stack between the original base
-/// and the live working-copy change. Each extracted change still contains only
-/// that session's diff, but causal edits can build on earlier sessions and the
-/// repository is left with one tool-created head instead of one sibling head per
-/// extraction.
-pub fn stack_extractions(
+pub fn extract(
+    root: &Path,
     jj: &Jj,
-    base: &str,
-    live: &str,
     evolog: &[Evolution],
-) -> Result<(), String> {
-    let mut tip = base.to_string();
-    for session in agents_in(evolog) {
-        let trailer = session_trailer(&session);
-        let Some(change) = jj.changes_with_description(&trailer)?.into_iter().next() else {
-            continue;
-        };
-        if change != tip {
-            jj.rebase_onto(&change, &tip)
-                .require("could not stack an extracted session change")?;
-        }
-        tip = change;
+    targets: &[(String, Option<String>)],
+) -> Result<Vec<Built>, String> {
+    let sessions = agents_in(evolog);
+    let mut existing_ids = HashMap::new();
+    for session in &sessions {
+        existing_ids.insert(
+            session.clone(),
+            jj.commits_with_description(&session_trailer(session))?,
+        );
     }
-    if tip != base {
-        jj.rebase_onto(live, &tip)
-            .require("could not place the live working copy on the extraction stack")?;
-    }
-    Ok(())
+    let settings = jj.settings(
+        evolog
+            .first()
+            .map(|e| e.user.as_str())
+            .unwrap_or("jj-extract"),
+    )?;
+    pollster::block_on(extract_async(
+        root,
+        evolog,
+        targets,
+        &sessions,
+        existing_ids,
+        settings.user_name(),
+        settings.user_email(),
+    ))
 }
 
-/// Build one agent's change from the evolog (chronological), rebased onto `base`.
-///
-/// The recorded evolutions all share `@`'s change id, so we must never make one a
-/// graph commit (that would fork `@` into divergent versions). Instead, for each
-/// evolution we build the delta on **fresh throwaway commits** created with
-/// `--no-edit`, so the live working-copy change is never left or auto-abandoned.
-/// Their *content* is restored from `pre`/`post` — a pre-image commit, then a
-/// child holding `post`'s content — making the child's diff exactly
-/// `diff(pre, post)`. We rebase that delta onto the accumulator and abandon the
-/// pre-image.
-pub fn build_one(
-    jj: &Jj,
-    base: &str,
+async fn extract_async(
+    root: &Path,
+    evolog: &[Evolution],
+    targets: &[(String, Option<String>)],
+    sessions: &[String],
+    existing_ids: HashMap<String, Vec<String>>,
+    user_name: &str,
+    user_email: &str,
+) -> Result<Vec<Built>, String> {
+    let neutral = evolog
+        .first()
+        .map(|e| e.user.as_str())
+        .ok_or_else(|| "nothing recorded yet".to_string())?;
+    let settings = extraction_settings(neutral, user_name, user_email)?;
+    let mut workspace = Workspace::load(
+        &settings,
+        root,
+        &default_backend_factories(),
+        &default_working_copy_factories(),
+    )
+    .map_err(|e| format!("could not load the jj workspace: {e}"))?;
+    let repo = workspace
+        .repo_loader()
+        .load_at_head()
+        .await
+        .map_err(|e| format!("could not load the jj repository: {e}"))?;
+    let store = repo.store();
+    let workspace_name = workspace.workspace_name().to_owned();
+    let live_id = repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .cloned()
+        .ok_or_else(|| "could not resolve the live working-copy commit".to_string())?;
+    let live = store
+        .get_commit(&live_id)
+        .map_err(|e| format!("could not load the live working-copy commit: {e}"))?;
+
+    let oldest = load_commit(store, &evolog[0].commit)?;
+    let base_id = oldest
+        .parent_ids()
+        .first()
+        .cloned()
+        .ok_or_else(|| "the oldest recorded evolution has no parent".to_string())?;
+    let base = store
+        .get_commit(&base_id)
+        .map_err(|e| format!("could not load the extraction base: {e}"))?;
+
+    let mut existing: HashMap<String, Vec<Commit>> = HashMap::new();
+    for (session, ids) in existing_ids {
+        let commits = ids
+            .iter()
+            .map(|id| load_commit(store, id))
+            .collect::<Result<Vec<_>, _>>()?;
+        existing.insert(session, commits);
+    }
+
+    let target_messages: HashMap<&str, Option<&str>> = targets
+        .iter()
+        .map(|(session, message)| (session.as_str(), message.as_deref()))
+        .collect();
+    let mut target_trees = HashMap::new();
+    for session in target_messages.keys() {
+        if let Some(tree) = compose_session_tree(store, &base, session, evolog).await? {
+            target_trees.insert((*session).to_string(), tree);
+        }
+    }
+    if target_trees.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let old_live_tree = live.tree();
+    let mut tx = repo.start_transaction();
+    tx.set_workspace_name(&workspace_name);
+    let mut tip = base.clone();
+    let mut built = Vec::new();
+
+    for session in sessions {
+        let mut prior_commits = existing.remove(session).unwrap_or_default();
+        let prior = prior_commits.first().cloned();
+        let (delta_base, delta_tree, description, is_target) =
+            if let Some(tree) = target_trees.get(session) {
+                (
+                    base.tree(),
+                    tree.clone(),
+                    extraction_desc(session, target_messages[session.as_str()]),
+                    true,
+                )
+            } else if let Some(commit) = &prior {
+                (
+                    commit.parent_tree(repo.as_ref()).await.map_err(|e| {
+                        format!("could not read {session}'s prior parent tree: {e}")
+                    })?,
+                    commit.tree(),
+                    commit.description().to_owned(),
+                    false,
+                )
+            } else {
+                continue;
+            };
+
+        let stacked_tree = apply_delta(&tip.tree(), &delta_base, &delta_tree)
+            .await
+            .map_err(|e| format!("could not stack session {session}: {e}"))?;
+        let updated = prior.is_some();
+        let commit = if let Some(prior) = prior {
+            tx.repo_mut()
+                .rewrite_commit(&prior)
+                .set_parents(vec![tip.id().clone()])
+                .set_tree(stacked_tree)
+                .set_description(description)
+                .write()
+                .await
+        } else {
+            tx.repo_mut()
+                .new_commit(vec![tip.id().clone()], stacked_tree)
+                .set_description(description)
+                .write()
+                .await
+        }
+        .map_err(|e| format!("could not write extracted session {session}: {e}"))?;
+
+        if prior_commits.len() > 1 {
+            for duplicate in prior_commits.drain(1..) {
+                tx.repo_mut().record_abandoned_commit(&duplicate);
+            }
+        }
+        if is_target {
+            built.push(Built {
+                session: session.clone(),
+                change_id: short_hex(commit.change_id().reverse_hex()),
+                conflict: commit.has_conflict(),
+                updated,
+            });
+        }
+        tip = commit;
+    }
+
+    let new_live = tx
+        .repo_mut()
+        .rewrite_commit(&live)
+        .set_parents(vec![tip.id().clone()])
+        .set_tree(old_live_tree.clone())
+        .write()
+        .await
+        .map_err(|e| {
+            format!("could not place the live working copy on the extraction stack: {e}")
+        })?;
+    tx.repo_mut()
+        .set_wc_commit(workspace_name.clone(), new_live.id().clone())
+        .map_err(|e| format!("could not preserve the live working-copy change: {e}"))?;
+    tx.repo_mut()
+        .rebase_descendants()
+        .await
+        .map_err(|e| format!("could not rebase descendants of extracted changes: {e}"))?;
+
+    let operation_description = if built.len() == 1 {
+        format!("extract session {}", built[0].session)
+    } else {
+        format!("extract {} sessions", built.len())
+    };
+    let new_repo = tx
+        .commit(operation_description)
+        .await
+        .map_err(|e| format!("could not commit the extraction transaction: {e}"))?;
+    let checked_out_id = new_repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .ok_or_else(|| "the extraction transaction lost the working-copy commit".to_string())?;
+    let checked_out = new_repo
+        .store()
+        .get_commit(checked_out_id)
+        .map_err(|e| format!("could not load the extracted working-copy commit: {e}"))?;
+    workspace
+        .check_out(new_repo.op_id().clone(), Some(&old_live_tree), &checked_out)
+        .await
+        .map_err(|e| format!("could not update the working copy after extraction: {e}"))?;
+
+    Ok(built)
+}
+
+async fn compose_session_tree(
+    store: &Arc<Store>,
+    base: &Commit,
     session: &str,
     evolog: &[Evolution],
-    message: Option<&str>,
-) -> Result<Option<Built>, String> {
-    let mut acc: Option<String> = None; // the agent's accumulating change id
-    let mut scaffolds: Vec<String> = vec![]; // throwaway pre-image commits to abandon
-
-    for i in 1..evolog.len() {
-        if evolog[i].user != session {
+) -> Result<Option<MergedTree>, String> {
+    let mut result = base.tree();
+    let mut found = false;
+    for index in 1..evolog.len() {
+        if evolog[index].user != session {
             continue;
         }
-        let pre = &evolog[i - 1].commit;
-        let post = &evolog[i].commit;
-
-        // Fresh pre-image commit on base, with pre's *content* (restore, not
-        // resurrect the evolution).
-        let preimg = jj.new_no_edit(base, &scaffold_marker("pre"))?;
-        jj.restore_into(&preimg, pre)
-            .require("could not restore an edit's pre-image")?;
-        // Fresh child holding post's content → its diff vs the pre-image is
-        // exactly diff(pre, post): this agent's edit for that step.
-        let delta = jj.new_no_edit(&preimg, &scaffold_marker("post"))?;
-        jj.restore_into(&delta, post)
-            .require("could not restore an edit's post-image")?;
-
-        match &acc {
-            None => {
-                jj.rebase_onto(&delta, base)
-                    .require("could not rebase the first recorded edit onto the base")?;
-                acc = Some(delta);
-            }
-            Some(c) => {
-                jj.rebase_onto(&delta, c)
-                    .require("could not compose a recorded edit onto the extraction")?;
-                jj.squash_into(&delta, c)
-                    .require("could not combine a recorded edit with the extraction")?;
-            }
-        }
-        scaffolds.push(preimg);
+        let before = load_commit(store, &evolog[index - 1].commit)?;
+        let after = load_commit(store, &evolog[index].commit)?;
+        result = apply_delta(&result, &before.tree(), &after.tree())
+            .await
+            .map_err(|e| format!("could not compose a recorded edit for {session}: {e}"))?;
+        found = true;
     }
-
-    let Some(change) = acc else {
-        return Ok(None);
-    };
-    for s in &scaffolds {
-        jj.abandon(s)
-            .require("could not clean up a temporary extraction change")?;
-    }
-    jj.describe(&change, &extraction_desc(session, message))
-        .require("could not describe the extracted change")?;
-    let conflict = jj.is_conflict(&change)?;
-    Ok(Some(Built {
-        session: session.to_string(),
-        change_id: change,
-        conflict,
-        updated: false,
-    }))
+    Ok(found.then_some(result))
 }
 
-fn scaffold_marker(kind: &str) -> String {
-    let sequence = NEXT_SCAFFOLD.fetch_add(1, Ordering::Relaxed);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!(
-        "jj-extract temporary {kind} {} {timestamp} {sequence}",
-        std::process::id()
-    )
+async fn apply_delta(
+    destination: &MergedTree,
+    before: &MergedTree,
+    after: &MergedTree,
+) -> jj_lib::backend::BackendResult<MergedTree> {
+    MergedTree::merge(Merge::from_vec(vec![
+        (destination.clone(), "extraction destination".to_string()),
+        (before.clone(), "before recorded edit".to_string()),
+        (after.clone(), "after recorded edit".to_string()),
+    ]))
+    .await
+}
+
+fn load_commit(store: &Arc<Store>, hex: &str) -> Result<Commit, String> {
+    let id = CommitId::try_from_hex(hex)
+        .ok_or_else(|| format!("recorded commit id is not valid hex: {hex}"))?;
+    store
+        .get_commit(&id)
+        .map_err(|e| format!("could not load recorded commit {hex}: {e}"))
+}
+
+fn extraction_settings(
+    operation_username: &str,
+    user_name: &str,
+    user_email: &str,
+) -> Result<UserSettings, String> {
+    let mut layer = ConfigLayer::empty(ConfigSource::User);
+    layer
+        .set_value("user.name", user_name)
+        .and_then(|_| layer.set_value("user.email", user_email))
+        .and_then(|_| layer.set_value("operation.username", operation_username))
+        .and_then(|_| layer.set_value("operation.hostname", "jj-extract.local"))
+        .map_err(|e| format!("could not build jj-lib settings: {e}"))?;
+    let mut config = StackedConfig::with_defaults();
+    config.add_layer(layer);
+    UserSettings::from_config(config).map_err(|e| format!("could not load jj-lib settings: {e}"))
+}
+
+fn short_hex(hex: String) -> String {
+    hex.chars().take(12).collect()
 }

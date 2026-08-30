@@ -60,6 +60,8 @@ n_extractions() { jj log -r "description(substring:\"jj-extract-session: $1\")" 
 n_divergent() { jj log -r 'all()' --no-graph -T 'if(divergent,"X","")' 2>/dev/null | grep -c X; }
 n_heads() { jj log -r 'heads(all()) ~ root()' --no-graph -T '"X\n"' 2>/dev/null | grep -c X; }
 is_conflict() { [ "$(jj log -r "$1" --no-graph -T 'if(conflict,"yes","no")' 2>/dev/null)" = yes ]; }
+op_id() { jj --at-op=@ --ignore-working-copy op log --no-graph -n 1 -T 'self.id() ++ "\n"'; }
+op_parent() { jj --at-op=@ --ignore-working-copy op log --no-graph -n 1 -T 'self.parents().map(|p| p.id()).join("\n") ++ "\n"'; }
 
 echo "== A: sequential interleaved edits to the SAME file (line numbers shift) =="
 new_repo a
@@ -239,6 +241,48 @@ ok "Codex apply_patch updates and new files are extracted" \
   "echo \"\$CODEX_RESULT\" | grep -q 'session codex-1' && has '$(cid codex-1)' CODEX && has '$(cid codex-1)' CODEX-NEW"
 ok "Codex extraction remains a single non-divergent head" \
   "[ \"$(n_heads)\" = 1 ] && [ \"$(n_divergent)\" = 0 ]"
+
+echo "== N: one undo reverses one complete extraction =="
+new_repo n
+edit a1 f.txt $'l1\nl2\nl3\nUNDO-LINE\n'
+LIVE_ID_BEFORE="$(jj log -r @ --no-graph -T 'change_id.short()')"
+OP_BEFORE="$(op_id)"
+JJ_EXTRACT_AGENT=a1 "$BIN" >/dev/null 2>&1
+ok "extract publishes exactly one operation" "[ \"$(op_parent)\" = '$OP_BEFORE' ]"
+ok "the operation describes the complete extraction" \
+  "jj --at-op=@ --ignore-working-copy op log --no-graph -n 1 -T 'description.first_line()' | grep -q '^extract session a1$'"
+jj undo >/dev/null 2>&1
+ok "one undo removes the extracted change" "[ \"$(n_extractions a1)\" = 0 ]"
+ok "one undo restores the live working-copy change" \
+  "[ \"$(jj log -r @ --no-graph -T 'change_id.short()')\" = '$LIVE_ID_BEFORE' ] && jj diff -r @ --git | grep -q UNDO-LINE"
+
+echo "== O: undoing a re-extraction restores the prior extracted version =="
+new_repo o
+edit a1 f.txt $'l1\nl2\nl3\nONE\n'
+ID1="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
+edit a1 f.txt $'TOP\nl1\nl2\nl3\nONE\n'
+OP_BEFORE_SECOND="$(op_id)"
+ID2="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
+ok "re-extraction is one operation" "[ \"$(op_parent)\" = '$OP_BEFORE_SECOND' ]"
+ok "re-extraction preserves the extracted change id" "[ -n '$ID1' ] && [ '$ID1' = '$ID2' ]"
+ok "re-extraction includes old and new edits" "has '$ID2' ONE && has '$ID2' TOP"
+jj undo >/dev/null 2>&1
+CURRENT_A1_ID="$(jj log -r 'description(substring:"jj-extract-session: a1")' --no-graph -T 'change_id.short()')"
+ok "undo restores the prior extracted content" \
+  "[ '$CURRENT_A1_ID' = '$ID1' ] && has '$CURRENT_A1_ID' ONE && nothas '$CURRENT_A1_ID' TOP"
+ok "undo returns the later edit to live @" "echo \"\$(jj diff -r @ --git)\" | grep -q TOP"
+
+echo "== P: jj-extract never invokes the jj executable =="
+new_repo p
+FAKE_BIN="$WORK/fake-bin"
+JJ_SPAWN_MARKER="$WORK/jj-was-spawned"
+mkdir -p "$FAKE_BIN"
+printf '#!/bin/sh\ntouch "%s"\nexit 97\n' "$JJ_SPAWN_MARKER" >"$FAKE_BIN/jj"
+chmod +x "$FAKE_BIN/jj"
+PATH="$FAKE_BIN:$PATH" edit a1 f.txt $'l1\nl2\nl3\nNO-SUBPROCESS\n'
+BUILT="$(PATH="$FAKE_BIN:$PATH" "$BIN" --all 2>&1)"
+ok "recording and extraction do not spawn jj" \
+  "[ ! -e '$JJ_SPAWN_MARKER' ] && has '$(cid a1)' NO-SUBPROCESS"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

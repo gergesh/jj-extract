@@ -17,6 +17,7 @@ mod hook;
 mod identity;
 mod install;
 mod jj;
+mod jj_config;
 mod lock;
 mod paths;
 
@@ -102,21 +103,10 @@ fn cmd_extract(message: Option<String>, agent_opt: Option<String>, all: bool) ->
             return 1;
         }
     };
-    // Use the parent of @'s oldest recorded evolution as the stable base. After
-    // an earlier extraction, @'s immediate parent is an extracted change; using
-    // that would replay already-extracted edits onto themselves on the next run.
-    let Some(first_evolution) = evolog.first() else {
+    if evolog.is_empty() {
         println!("Nothing recorded yet.");
         return 0;
-    };
-    let original_parent = format!("{}-", first_evolution.commit);
-    let base = match jj.change_id(&original_parent) {
-        Some(b) => b,
-        None => {
-            err("Could not resolve the parent of the first recorded evolution.");
-            return 1;
-        }
-    };
+    }
 
     let targets: Vec<(String, Option<String>)> = if all {
         construct::agents_in(&evolog)
@@ -131,69 +121,13 @@ fn cmd_extract(message: Option<String>, agent_opt: Option<String>, all: bool) ->
         vec![(agent, message)]
     };
 
-    // Preserve the live working-copy change id while extracted changes are
-    // rebuilt and inserted below it.
-    let orig = match jj.change_id("@") {
-        Some(change) => change,
-        None => {
-            err("Could not resolve the live working-copy change.");
+    let built = match construct::extract(&root, &jj, &evolog, &targets) {
+        Ok(built) => built,
+        Err(e) => {
+            err(&format!("Extraction stopped: {e}"));
             return 1;
         }
     };
-    let mut built = vec![];
-    let mut build_error = None;
-    for (agent, msg) in &targets {
-        match construct::build_one(&jj, &base, agent, &evolog, msg.as_deref()) {
-            Ok(Some(mut b)) => {
-                // Idempotency: if this session was already extracted, update that
-                // change in place instead of leaving a duplicate behind.
-                match construct::reconcile_idempotent(&jj, agent, &b.change_id, msg.as_deref()) {
-                    Ok((id, updated)) => {
-                        b.change_id = id;
-                        b.updated = updated;
-                        built.push(b);
-                    }
-                    Err(e) => {
-                        build_error = Some(e);
-                        break;
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                build_error = Some(e);
-                break;
-            }
-        }
-    }
-    if build_error.is_none() && !built.is_empty() {
-        if let Err(e) = construct::stack_extractions(&jj, &base, &orig, &evolog) {
-            build_error = Some(e);
-        } else {
-            for extracted in &mut built {
-                match jj.is_conflict(&extracted.change_id) {
-                    Ok(conflict) => extracted.conflict = conflict,
-                    Err(e) => {
-                        build_error = Some(e);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if let Err(e) = jj
-        .edit(&orig)
-        .require("could not restore the original working copy")
-    {
-        err(&e);
-        return 1;
-    }
-    if let Some(e) = build_error {
-        err(&format!(
-            "Extraction stopped: {e}\nThe original working copy was restored; rerun after fixing the reported jj error."
-        ));
-        return 1;
-    }
 
     if built.is_empty() {
         println!("Nothing to extract for the requested session(s).");
@@ -269,9 +203,12 @@ fn cmd_install(project: bool) -> i32 {
         );
     }
     println!("  command:  {full}");
-    match set_jj_alias() {
-        Ok(()) => {
-            println!("  alias:    `jj extract …` (jj user config → aliases.extract)");
+    match jj_config::install_alias(current_exe()) {
+        Ok(path) => {
+            println!(
+                "  alias:    `jj extract …` (jj user config → {})",
+                path.display()
+            );
         }
         Err(e) => {
             err(&format!(
@@ -318,8 +255,8 @@ fn cmd_uninstall(project: bool) -> i32 {
             }
         }
     }
-    match unset_jj_alias() {
-        Ok(()) => 0,
+    match jj_config::uninstall_alias() {
+        Ok(_) => 0,
         Err(e) => {
             err(&format!(
                 "Hooks were removed, but the `jj extract` alias could not be removed: {e}"
@@ -327,83 +264,6 @@ fn cmd_uninstall(project: bool) -> i32 {
             1
         }
     }
-}
-
-/// Register `jj extract …` as a jj user alias that shells out to this binary via
-/// `jj util exec` (the documented pattern for external jj subcommands).
-fn set_jj_alias() -> Result<(), String> {
-    let exe = current_exe();
-    let alias = vec![
-        "util".to_string(),
-        "exec".to_string(),
-        "--".to_string(),
-        exe,
-    ];
-    if get_jj_alias()?.as_ref() == Some(&alias) {
-        return Ok(());
-    }
-    let value = serde_json::to_string(&alias).unwrap();
-    run_jj_config(std::process::Command::new("jj").args([
-        "config",
-        "set",
-        "--user",
-        "aliases.extract",
-        &value,
-    ]))
-}
-
-fn unset_jj_alias() -> Result<(), String> {
-    let Some(alias) = get_jj_alias()? else {
-        return Ok(());
-    };
-    let owned = alias
-        .last()
-        .and_then(|part| std::path::Path::new(part).file_name())
-        .and_then(|name| name.to_str())
-        == Some("jj-extract");
-    if !owned {
-        return Err(
-            "refusing to remove aliases.extract because it is not a jj-extract alias".into(),
-        );
-    }
-    run_jj_config(std::process::Command::new("jj").args([
-        "config",
-        "unset",
-        "--user",
-        "aliases.extract",
-    ]))
-}
-
-fn get_jj_alias() -> Result<Option<Vec<String>>, String> {
-    let output = std::process::Command::new("jj")
-        .args(["config", "get", "aliases.extract"])
-        .output()
-        .map_err(|e| format!("could not run `jj`: {e}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        if detail.contains("No matching config key") || detail.contains("not found") {
-            return Ok(None);
-        }
-        return Err(detail.trim().to_string());
-    }
-    serde_json::from_slice(&output.stdout)
-        .map(Some)
-        .map_err(|e| format!("could not parse the existing aliases.extract value: {e}"))
-}
-
-fn run_jj_config(command: &mut std::process::Command) -> Result<(), String> {
-    let output = command
-        .output()
-        .map_err(|e| format!("could not run `jj`: {e}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(if detail.is_empty() {
-        format!("`jj config` exited with {}", output.status)
-    } else {
-        detail
-    })
 }
 
 // --------------------------------------------------------------------------- //

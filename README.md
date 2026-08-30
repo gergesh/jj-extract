@@ -16,8 +16,8 @@ session change instead of creating duplicates.
 
 ## Requirements
 
-- A `jj` repository and the `jj` CLI on `PATH`
-- Rust and Cargo to install from source
+- A `jj` 0.44.x repository (the CLI is needed to invoke `jj extract`)
+- Rust 1.89 or newer and Cargo to install from source
 - Claude Code or Codex for automatic edit recording
 
 `jj-extract` is intentionally jj-native. A plain Git repository without a `.jj`
@@ -92,6 +92,15 @@ between the original base and live `@`; the live change is rebased on top. Each
 stack entry's diff contains only that session's edits, while edits that were not
 attributed remain in `@`.
 
+Extraction is committed through `jj-lib` as one repository transaction, even
+when several session changes are built or updated. One `jj undo` therefore
+reverses one complete extraction; undoing a re-extraction restores the prior
+version of the same extracted change. Because the library API is versioned with
+jj, jj-extract currently embeds `jj-lib` 0.44.0 and supports jj 0.44.x.
+Recording, evolution traversal, commit lookup, and extraction all use `jj-lib`
+directly; jj-extract never spawns the `jj` CLI. Installation writes its owned
+`conf.d/zz-jj-extract.toml` alias fragment with jj-lib's config API.
+
 This produces one linear head instead of a sibling branch per session. It also
 lets a later session build on an earlier session's extracted change, avoiding
 false conflicts for causally dependent edits. Inspect an entry with the
@@ -110,7 +119,7 @@ normal jj conflict resolution.
 ```text
 PreToolUse                         PostToolUse
   acquire repository edit lock      snapshot with the session as jj's op user
-  neutral `jj status` snapshot      release the edit lock
+  neutral jj-lib snapshot            release the edit lock
   allow the file tool to run
 
 `jj extract`
@@ -198,6 +207,8 @@ the real binary and currently covers:
 - a single linear head with no divergent change IDs;
 - conflict-free stacking of causally dependent session edits;
 - automatic linearization of legacy sibling extraction heads;
+- single-operation extraction and re-extraction with one-step `jj undo`;
+- operation with no `jj` executable available to the jj-extract process;
 - isolated dual-client install/uninstall and settings preservation;
 - Codex `apply_patch` attribution and `CODEX_THREAD_ID` identity;
 - malformed settings and incompatible CLI option failures.
@@ -213,7 +224,8 @@ Source layout:
 
 - `src/hook.rs` records attributed snapshots.
 - `src/construct.rs` reconstructs isolated changes.
-- `src/jj.rs` contains the jj CLI boundary.
+- `src/jj.rs` records and reads repository state through `jj-lib`.
+- `src/jj_config.rs` manages jj-extract's owned user-config fragment.
 - `src/install.rs` safely merges and removes Claude Code and Codex hooks.
 - `src/lock.rs` implements the cross-hook edit lock.
 - `.agents/skills/jj-extract` teaches Codex the extraction workflow.

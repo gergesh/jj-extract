@@ -2,7 +2,7 @@
 name = "jj-extract"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Per-agent change attribution for a shared jj working copy: edits are recorded into jj's evolog, then `jj extract` pulls each agent's edits into their own change."
 license = "MIT"
 repository = "https://github.com/gergesh/jj-extract"
@@ -20,6 +20,9 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
+futures = "0.3"
+jj-lib = "=0.44.0"
+pollster = "1.0.1"
 
 [profile.release]
 strip = true
