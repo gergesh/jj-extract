@@ -7,6 +7,10 @@
 //! evolution by the neutral pre-snapshot, so they can't fold into an agent's
 //! change.
 //!
+//! An edit never starts *tracking* a file: only the paths the tool creates are
+//! offered to the snapshot as trackable (see [`crate::new_files`]), so a file the
+//! user left untracked stays untracked however often an agent edits it.
+//!
 //! Each edit is bracketed by the **edit lock** (Pre takes it, Post releases it),
 //! so a peer can't write while this edit is in flight — the agent's snapshot then
 //! captures only its own edit. The lock guards just a fast write+snapshot, so
@@ -22,6 +26,7 @@ use std::path::Path;
 
 use crate::identity::{from_payload, ENV_VAR};
 use crate::jj::Jj;
+use crate::new_files;
 use crate::paths::{central_root, find_repo_root, relpath_within};
 
 const FILE_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "apply_patch"];
@@ -78,23 +83,33 @@ fn dispatch(payload: &Value) {
     };
     let agent = from_payload(payload.get("session_id").and_then(Value::as_str));
 
-    // The lock lives in the repo's own `.jj/` — no central data dir needed.
-    let lock_dir = root.join(".jj");
+    // The lock and the new-file note live in the repo's own `.jj/` — no central
+    // data dir needed.
+    let state_dir = root.join(".jj");
     let jj = Jj::new(&root);
 
     if event == "PreToolUse" {
         // Hold the edit lock across the write (released at PostToolUse) so no peer
         // writes meanwhile. The neutral snapshot flushes anything already on disk
         // (a Bash/human change) to an unattributed evolution.
-        crate::lock::acquire(&lock_dir, &agent);
+        crate::lock::acquire(&state_dir, &agent);
+        // Under that lock, note which targets don't exist yet: those, and only
+        // those, are the files this edit may start tracking.
+        let creating: Vec<String> = edited_paths(payload, &|p| relpath_within(p, &root))
+            .into_iter()
+            .filter(|file| !root.join(file).exists())
+            .collect();
+        new_files::record(&state_dir, &agent, &creating);
         jj.snapshot_neutral();
         return;
     }
 
-    // PostToolUse: capture the edit as this agent's evolution, then release.
-    let files = edited_paths(payload, &|p| relpath_within(p, &root));
-    jj.snapshot_tagged(&agent, &files);
-    crate::lock::release(&lock_dir, &agent);
+    // PostToolUse: capture the edit as this agent's evolution, then release. The
+    // snapshot always covers every tracked file; the paths only say what may
+    // *become* tracked, so an edit to an untracked file leaves it untracked.
+    let created = new_files::take(&state_dir, &agent);
+    jj.snapshot_tagged(&agent, &created);
+    crate::lock::release(&state_dir, &agent);
 }
 
 /// Extract repo-relative edited paths from Claude file-tool or Codex apply_patch

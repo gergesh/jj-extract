@@ -49,9 +49,10 @@ impl Jj {
         let _ = pollster::block_on(self.snapshot(None, &[]));
     }
 
-    /// Snapshot the working copy in an operation owned by `agent`. Only the
-    /// named paths are eligible to become newly tracked; tracked paths are
-    /// always snapshotted by jj's working-copy implementation.
+    /// Snapshot the working copy in an operation owned by `agent`. Every tracked
+    /// path is snapshotted by jj's working-copy implementation; the named paths
+    /// (the files this edit created) are the only ones allowed to *start* being
+    /// tracked, so editing an untracked file never pulls it into the repo.
     pub fn snapshot_tagged(&self, agent: &str, paths: &[String]) {
         let _ = pollster::block_on(self.snapshot(Some(agent), paths));
     }

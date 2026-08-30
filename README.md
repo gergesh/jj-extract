@@ -124,13 +124,20 @@ normal jj conflict resolution.
 ```text
 PreToolUse                         PostToolUse
   acquire repository edit lock      snapshot with the session as jj's op user
-  neutral jj-lib snapshot            release the edit lock
+  note which targets don't exist     release the edit lock
+  neutral jj-lib snapshot
   allow the file tool to run
 
 `jj extract`
   read @'s evolutions → replay with causal context → remove commuting neutral edits
   → stack session changes → preserve live @'s exact tree on top
 ```
+
+Recording never starts tracking a file. Each snapshot covers every path jj
+already tracks, and only the paths the tool creates — those that did not exist
+when its PreToolUse hook ran — are offered to jj as newly trackable. A file left
+untracked on purpose therefore stays untracked however often an agent edits it,
+and its content is never extracted.
 
 The neutral pre-snapshot separates changes already present on disk from the
 upcoming tool edit. The lock in `.jj/jj-extract.lock` prevents two file tools
@@ -155,6 +162,9 @@ conflict between two snapshots from that session.
   neutrally and remain in live `@` when they commute cleanly with attributed
   edits. An overlapping neutral rewrite may be adopted when a later attributed
   edit on the same path causally depends on it.
+- An edit to an untracked file is not recorded: only a file an agent creates
+  begins being tracked, so edits to ignored or deliberately untracked paths stay
+  out of the repository and out of extracted changes.
 - Recording adds a fast jj snapshot around every supported file edit.
 - Hook failures never block the agent's tool call. Best-effort diagnostics are
   appended to `~/.jj-extract/hook-error.log` (or

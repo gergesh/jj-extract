@@ -16,6 +16,10 @@ BIN="${1:-$REPO_ROOT/target/debug/jj-extract}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export JJ_GIT_OK=1 JJ_EDITOR=true
+# The suite drives identity through hook payloads, so an inherited one must not
+# win over them: a Claude Code or Codex session running these tests exports its
+# own agent identity, which would otherwise tag every edit below as that session.
+unset JJ_EXTRACT_AGENT CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
 
 PASS=0
 FAIL=0
@@ -352,6 +356,19 @@ ok "a same-session extraction on another base gets a new change id" \
   "[ -n '$FIRST_ID' ] && [ -n '$SECOND_ID' ] && [ '$FIRST_ID' != '$SECOND_ID' ]"
 ok "the extraction on the first line is left unchanged" \
   "has '$FIRST_ID' FIRST-LINE && nothas '$FIRST_ID' SECOND-LINE"
+
+echo "== R: an edit never starts tracking a file; only a created file does =="
+new_repo r
+jj config set --repo snapshot.auto-track 'none()' >/dev/null 2>&1
+printf 'kept out of the repo\n' >untracked.txt   # exists, deliberately untracked
+edit a1 untracked.txt $'kept out of the repo\nAGENT-EDIT\n'
+edit a1 created.txt $'AGENT-CREATED\n'           # a file the agent itself creates
+extract_all
+ok "an edit to an untracked file is not extracted" "nothas '$(cid a1)' AGENT-EDIT"
+ok "an edited untracked file stays untracked" \
+  "! jj file list -r @ 2>/dev/null | grep -q untracked.txt"
+ok "a file the agent created is tracked and extracted" \
+  "has '$(cid a1)' AGENT-CREATED && jj file list -r @ 2>/dev/null | grep -q created.txt"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

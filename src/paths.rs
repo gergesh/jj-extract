@@ -2,6 +2,7 @@
 //! per-repo data directory; `central_root` is only used for the best-effort hook
 //! error log. `JJ_EXTRACT_HOME` relocates that root.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Nearest ancestor (inclusive) that is a jj working copy. jj-extract is
@@ -33,10 +34,11 @@ pub fn relpath_within(p: &str, root: &Path) -> Option<String> {
     } else {
         root.join(pp)
     };
-    // Canonicalize the existing prefix so symlinks in the repo path don't defeat
-    // the strip; fall back to lexical if the file was since deleted.
-    let abs = abs.canonicalize().unwrap_or(abs);
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // Canonicalize both through their deepest existing ancestor, so symlinks in
+    // the repo path can't defeat the strip for a path that isn't on disk — one a
+    // tool is about to create, or has just deleted.
+    let abs = canonical_prefix(&abs);
+    let root = canonical_prefix(root);
     let relative = abs.strip_prefix(&root).ok()?;
     if relative
         .components()
@@ -45,6 +47,26 @@ pub fn relpath_within(p: &str, root: &Path) -> Option<String> {
         return None;
     }
     Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+/// `path` with its deepest existing ancestor canonicalized and the missing tail
+/// re-attached. Plain `canonicalize` resolves nothing at all for a path that
+/// doesn't exist, which would leave a symlinked ancestor unresolved.
+fn canonical_prefix(path: &Path) -> PathBuf {
+    let mut missing: Vec<OsString> = vec![];
+    let mut existing = path.to_path_buf();
+    loop {
+        if let Ok(resolved) = existing.canonicalize() {
+            return resolved.join(missing.iter().rev().collect::<PathBuf>());
+        }
+        match (existing.file_name().map(OsString::from), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                missing.push(name);
+                existing = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -56,6 +78,23 @@ mod tests {
         let root = std::env::temp_dir().join("jj-extract-path-test-root");
         let escaped = root.join("..").join("outside").join("missing.txt");
         assert_eq!(relpath_within(&escaped.to_string_lossy(), &root), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_a_path_a_tool_is_about_to_create_under_a_symlinked_root() {
+        let base = std::env::temp_dir().join("jj-extract-path-test-symlink");
+        let real = base.join("real");
+        let link = base.join("link");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&real).expect("create the real root");
+        std::os::unix::fs::symlink(&real, &link).expect("link to the real root");
+
+        let created = link.join("new.txt");
+        assert_eq!(
+            relpath_within(&created.to_string_lossy(), &real).as_deref(),
+            Some("new.txt")
+        );
     }
 
     #[test]

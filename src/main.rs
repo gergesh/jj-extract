@@ -19,6 +19,7 @@ mod install;
 mod jj;
 mod jj_config;
 mod lock;
+mod new_files;
 mod paths;
 
 use clap::{ArgGroup, Parser};
