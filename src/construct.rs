@@ -1,12 +1,14 @@
 //! Extract recorded agent edits in one jj transaction.
 //!
 //! Every attributed evolution contributes the tree delta from its predecessor
-//! to itself. We compose those deltas in memory, rewrite the extracted stack and
-//! the live working-copy commit once, then publish one operation. This keeps the
-//! operation log as the attribution ledger while making one `jj undo` reverse a
-//! complete extraction.
+//! to itself. Neutral snapshots preceding an edit are carried on the paths that
+//! edit touched, then removed again when their inverse commutes cleanly. We
+//! compose those deltas in memory, rewrite the extracted stack and the live
+//! working-copy commit once, then publish one operation. This keeps the operation
+//! log as the attribution ledger while making one `jj undo` reverse a complete
+//! extraction.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,9 +18,13 @@ use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::default_backend_factories::{
     default_backend_factories, default_working_copy_factories,
 };
+use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::repo::Repo as _;
+use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::revset::{RevsetExpression, RevsetStreamExt as _};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::workspace::Workspace;
@@ -64,13 +70,6 @@ pub fn extract(
     targets: &[(String, Option<String>)],
 ) -> Result<Vec<Built>, String> {
     let sessions = agents_in(evolog);
-    let mut existing_ids = HashMap::new();
-    for session in &sessions {
-        existing_ids.insert(
-            session.clone(),
-            jj.commits_with_description(&session_trailer(session))?,
-        );
-    }
     let settings = jj.settings(
         evolog
             .first()
@@ -82,7 +81,6 @@ pub fn extract(
         evolog,
         targets,
         &sessions,
-        existing_ids,
         settings.user_name(),
         settings.user_email(),
     ))
@@ -93,7 +91,6 @@ async fn extract_async(
     evolog: &[Evolution],
     targets: &[(String, Option<String>)],
     sessions: &[String],
-    existing_ids: HashMap<String, Vec<String>>,
     user_name: &str,
     user_email: &str,
 ) -> Result<Vec<Built>, String> {
@@ -135,14 +132,7 @@ async fn extract_async(
         .get_commit(&base_id)
         .map_err(|e| format!("could not load the extraction base: {e}"))?;
 
-    let mut existing: HashMap<String, Vec<Commit>> = HashMap::new();
-    for (session, ids) in existing_ids {
-        let commits = ids
-            .iter()
-            .map(|id| load_commit(store, id))
-            .collect::<Result<Vec<_>, _>>()?;
-        existing.insert(session, commits);
-    }
+    let mut existing = existing_extractions(repo.as_ref(), &base, sessions).await?;
 
     let target_messages: HashMap<&str, Option<&str>> = targets
         .iter()
@@ -268,6 +258,42 @@ async fn extract_async(
     Ok(built)
 }
 
+async fn existing_extractions(
+    repo: &dyn jj_lib::repo::Repo,
+    base: &Commit,
+    sessions: &[String],
+) -> Result<HashMap<String, Vec<Commit>>, String> {
+    use futures::TryStreamExt as _;
+
+    // A session can have extracted changes on another visible branch. Only a
+    // change descended from this working-copy line's stable extraction base is a
+    // candidate for in-place update or legacy-stack linearization.
+    let descendants = RevsetExpression::commits(vec![base.id().clone()]).descendants();
+    let expression = descendants.intersection(&RevsetExpression::all());
+    let revset = expression
+        .evaluate(repo)
+        .map_err(|e| format!("could not evaluate existing extracted changes: {e}"))?;
+    let commits: Vec<_> = revset
+        .stream()
+        .commits(repo.store())
+        .try_collect()
+        .await
+        .map_err(|e| format!("could not read existing extracted changes: {e}"))?;
+
+    let mut existing: HashMap<String, Vec<Commit>> = HashMap::new();
+    for commit in commits {
+        for session in sessions {
+            if commit.description().contains(&session_trailer(session)) {
+                existing
+                    .entry(session.clone())
+                    .or_default()
+                    .push(commit.clone());
+            }
+        }
+    }
+    Ok(existing)
+}
+
 async fn compose_session_tree(
     store: &Arc<Store>,
     base: &Commit,
@@ -275,6 +301,8 @@ async fn compose_session_tree(
     evolog: &[Evolution],
 ) -> Result<Option<MergedTree>, String> {
     let mut result = base.tree();
+    let neutral = evolog.first().map(|e| e.user.as_str()).unwrap_or("");
+    let mut carried_neutral = Vec::new();
     let mut found = false;
     for index in 1..evolog.len() {
         if evolog[index].user != session {
@@ -282,12 +310,95 @@ async fn compose_session_tree(
         }
         let before = load_commit(store, &evolog[index - 1].commit)?;
         let after = load_commit(store, &evolog[index].commit)?;
+
+        // A neutral snapshot between two edits from the same session can be
+        // causal context for the later edit (most commonly formatter output). Add
+        // only overlapping paths before replaying the attributed delta. We try
+        // to remove that context again after all attributed edits have been
+        // composed; if the inverse conflicts, the session depended on it and
+        // the context belongs with the extracted change.
+        let mut context_start = index - 1;
+        while context_start > 0
+            && evolog[context_start].user == neutral
+            && evolog[context_start].is_snapshot
+        {
+            context_start -= 1;
+        }
+        if context_start < index - 1 {
+            let context_before = load_commit(store, &evolog[context_start].commit)?;
+            let actual_paths = changed_paths(&before.tree(), &after.tree()).await?;
+            let neutral_paths = changed_paths(&context_before.tree(), &before.tree()).await?;
+            let overlapping_paths = neutral_paths
+                .intersection(&actual_paths)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !overlapping_paths.is_empty() {
+                let restricted_before =
+                    paths_from(&base.tree(), &context_before.tree(), &overlapping_paths).await?;
+                let restricted_after =
+                    paths_from(&base.tree(), &before.tree(), &overlapping_paths).await?;
+                result = apply_delta(&result, &restricted_before, &restricted_after)
+                    .await
+                    .map_err(|e| format!("could not replay causal context for {session}: {e}"))?;
+                carried_neutral.push((restricted_before, restricted_after));
+            }
+        }
         result = apply_delta(&result, &before.tree(), &after.tree())
             .await
             .map_err(|e| format!("could not compose a recorded edit for {session}: {e}"))?;
         found = true;
     }
+
+    for (before, after) in carried_neutral.into_iter().rev() {
+        let candidate = apply_delta(&result, &after, &before)
+            .await
+            .map_err(|e| format!("could not remove neutral context for {session}: {e}"))?;
+        if !candidate.has_conflict() {
+            result = candidate;
+        }
+    }
     Ok(found.then_some(result))
+}
+
+async fn changed_paths(
+    before: &MergedTree,
+    after: &MergedTree,
+) -> Result<BTreeSet<RepoPathBuf>, String> {
+    use futures::StreamExt as _;
+
+    let mut stream = before.diff_stream(after, &EverythingMatcher);
+    let mut paths = BTreeSet::new();
+    while let Some(entry) = stream.next().await {
+        entry.values.map_err(|e| {
+            format!(
+                "could not read tree difference at {}: {e}",
+                entry.path.as_internal_file_string()
+            )
+        })?;
+        paths.insert(entry.path);
+    }
+    Ok(paths)
+}
+
+async fn paths_from(
+    base: &MergedTree,
+    source: &MergedTree,
+    paths: &BTreeSet<RepoPathBuf>,
+) -> Result<MergedTree, String> {
+    let mut builder = MergedTreeBuilder::new(base.clone());
+    for path in paths {
+        let value = source.path_value(path).await.map_err(|e| {
+            format!(
+                "could not read causal-context path {}: {e}",
+                path.as_internal_file_string()
+            )
+        })?;
+        builder.set_or_remove(path.clone(), value);
+    }
+    builder
+        .write_tree()
+        .await
+        .map_err(|e| format!("could not write causal-context tree: {e}"))
 }
 
 async fn apply_delta(

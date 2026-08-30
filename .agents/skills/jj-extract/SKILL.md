@@ -30,7 +30,9 @@ a separate branch for the session.
 - Use `jj extract --all` only when intentionally collecting every recorded
   session.
 - Preserve the live working-copy change. Attributed edits move into the stack;
-  unattributed shell, formatter, or human edits remain in live `@`.
+  independent shell, formatter, or human edits remain in live `@`. An
+  overlapping neutral rewrite may move with a later attributed edit on the same
+  path when separating them would create a conflict.
 - If `jj extract` reports conflicts, inspect the printed change with `jj show`
   and report the conflict instead of hiding it.
 - If the command is unavailable, continue working normally and mention that the

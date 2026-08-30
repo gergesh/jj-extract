@@ -19,25 +19,28 @@ start. When you want your work as its own commit, run:
 jj extract -m "<short description of what you did>"
 ```
 
-That reconstructs a jj change containing **only your** edits — down to the line,
-separate from everyone else's — and prints its id. Extracted session changes are
-kept in first-edit order as a linear stack below the live working copy, so the
-command does not leave a sibling branch per agent.
+That reconstructs a jj change containing your attributed edits and prints its
+id. Extracted session changes are kept in first-edit order as a linear stack
+below the live working copy, so the command does not leave a sibling branch per
+agent.
 
 ## Why
 
 Without it, your edits sit in the shared working copy mixed with other agents'
 (and any `jj`/Bash side-effects) and can't be told apart. `jj extract` pulls out
-exactly what you changed through your tools — even if you and another agent edited
-the same file in different places, and even if a Bash command touched a file you
-also edited (that lands unattributed, not in your change).
+what you changed through your tools — even if you and another agent edited the
+same file in different places. Independent Bash changes stay unattributed; an
+overlapping rewrite that a later attributed edit depends on may move with it to
+avoid a false conflict.
 
 ## Notes
 
 - Nothing to do up front — just edit; recording is automatic.
 - `jj extract` is safe to run alongside other agents.
 - The live working-copy change and file contents are preserved; attributed edits
-  move into the extraction stack and unattributed edits remain in live `@`.
+  move into the extraction stack and independent unattributed edits remain in
+  live `@`. An overlapping neutral rewrite may move with a later attributed edit
+  on the same path when separating them would create a conflict.
 - `jj extract --all` builds a change for every session (for whoever is collecting
   everyone's work).
 - If `jj-extract` isn't installed (no `jj extract` command), ignore this and work

@@ -88,9 +88,10 @@ identity comes from `JJ_EXTRACT_AGENT`, `CLAUDE_CODE_SESSION_ID`, or
 
 After extraction, the shared live working-copy change remains checked out and its
 files are unchanged. Extracted changes are inserted as a chronological stack
-between the original base and live `@`; the live change is rebased on top. Each
-stack entry's diff contains only that session's edits, while edits that were not
-attributed remain in `@`.
+between the original base and live `@`; the live change is rebased on top while
+its exact pre-extraction tree is preserved. Each stack entry's diff contains
+that session's edits, while independent edits that were not attributed remain
+in `@`.
 
 Extraction is committed through `jj-lib` as one repository transaction, even
 when several session changes are built or updated. One `jj undo` therefore
@@ -110,6 +111,10 @@ If an older jj-extract release already left session changes as sibling heads,
 the next extraction linearizes those owned changes while preserving their change
 IDs.
 
+Re-extraction updates an existing session change only on the same stable
+extraction base. The same session extracted from another branch line receives a
+distinct change ID instead of rewriting the earlier line.
+
 If two sessions edit the same lines, jj may produce a conflict. `jj-extract`
 reports that explicitly and leaves the conflict in the extracted change for
 normal jj conflict resolution.
@@ -123,7 +128,8 @@ PreToolUse                         PostToolUse
   allow the file tool to run
 
 `jj extract`
-  read @'s evolutions → replay session deltas → stack them → rebase live @ on top
+  read @'s evolutions → replay with causal context → remove commuting neutral edits
+  → stack session changes → preserve live @'s exact tree on top
 ```
 
 The neutral pre-snapshot separates changes already present on disk from the
@@ -133,7 +139,12 @@ post-hook cannot permanently block later edits.
 
 Extraction uses content-addressed snapshots and jj's three-way merge rather than
 remembering line numbers. That keeps attribution correct when another session
-inserts or deletes lines earlier in the same file.
+inserts or deletes lines earlier in the same file. If a neutral formatter or
+shell rewrite touches a path immediately before the agent edits it, extraction
+temporarily carries that rewrite as causal context. It removes the neutral delta
+again when it commutes cleanly; if removing it would itself conflict, the
+overlapping rewrite is adopted into the session instead of manufacturing a
+conflict between two snapshots from that session.
 
 ## Scope and limitations
 
@@ -141,7 +152,9 @@ inserts or deletes lines earlier in the same file.
   tools and Codex's `apply_patch` tool, including add, update, delete, and move
   paths.
 - Changes made by Bash commands, formatters, humans, or other tools are recorded
-  neutrally and are not included in a session's extracted change.
+  neutrally and remain in live `@` when they commute cleanly with attributed
+  edits. An overlapping neutral rewrite may be adopted when a later attributed
+  edit on the same path causally depends on it.
 - Recording adds a fast jj snapshot around every supported file edit.
 - Hook failures never block the agent's tool call. Best-effort diagnostics are
   appended to `~/.jj-extract/hook-error.log` (or

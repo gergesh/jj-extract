@@ -111,6 +111,46 @@ edit a1 g.txt $'first line\nsecond line\n'             # extend it
 extract_all
 ok "new-file create+extend both collected" "has '$(cid a1)' 'first line' && has '$(cid a1)' 'second line'"
 
+echo "== E2: a later agent edit absorbs same-file neutral formatting context =="
+new_repo e2
+codex_add a1 picker.ts $'const picker={hour:19}\n'
+printf 'const picker = { hour: 19 }\n' >picker.ts             # formatter/shell edit, captured neutrally
+printf 'l1\nl2\nl3\nFOREIGN\n' >f.txt                 # unrelated neutral edit must stay live
+codex_edit a1 picker.ts $'const picker = { hour: 20 }\n'
+extract_all
+ok "same-file neutral context composes without conflict" \
+  "! is_conflict '$(cid a1)' && has '$(cid a1)' 'hour: 20'"
+ok "absorbed new file is fully removed from live @" \
+  "! jj diff -r @ --summary | grep -q picker.ts"
+ok "unrelated neutral content still remains in live @" \
+  "jj diff -r @ --git | grep -q FOREIGN"
+
+echo "== E3: overlapping formatter context also works on an existing file =="
+new_repo e3
+printf 'const picker={hour:19}\n' >picker.ts
+jj file track picker.ts >/dev/null 2>&1
+jj describe -m picker-base >/dev/null 2>&1
+jj new >/dev/null 2>&1
+codex_edit a1 picker.ts $'const picker={hour:19,minute:30}\n'
+printf 'const picker = { hour: 19, minute: 30 }\n' >picker.ts
+codex_edit a1 picker.ts $'const picker = { hour: 20, minute: 30 }\n'
+extract_all
+ok "overlapping formatter rewrite is adopted without conflict" \
+  "! is_conflict '$(cid a1)' && has '$(cid a1)' 'hour: 20'"
+ok "existing formatted file leaves no duplicate residual" \
+  "! jj diff -r @ --summary | grep -q picker.ts"
+
+echo "== E4: causal replay handles fileset-special paths =="
+new_repo e4
+codex_add a1 'picker & time.ts' $'const picker={hour:19}\n'
+printf 'const picker = { hour: 19 }\n' >'picker & time.ts'
+codex_edit a1 'picker & time.ts' $'const picker = { hour: 20 }\n'
+extract_all
+ok "special path extracts without conflict" \
+  "! is_conflict '$(cid a1)' && has '$(cid a1)' 'hour: 20'"
+ok "special path leaves no duplicate residual" \
+  "! jj diff -r @ --summary | grep -Fq 'picker & time.ts'"
+
 echo "== F: re-running extract updates in place (idempotent), no duplicates =="
 new_repo f
 edit a1 f.txt $'l1\nl2\nl3\nONE\n'
@@ -242,6 +282,18 @@ ok "Codex apply_patch updates and new files are extracted" \
 ok "Codex extraction remains a single non-divergent head" \
   "[ \"$(n_heads)\" = 1 ] && [ \"$(n_divergent)\" = 0 ]"
 
+echo "== M2: live @ preserves its clean tree above a conflicted extraction =="
+new_repo m2
+edit a1 f.txt $'A1\nl2\nl3\n'
+edit a2 f.txt $'A2\nl2\nl3\n'
+edit a1 f.txt $'A1-LATER\nl2\nl3\n'
+M2_RESULT="$(JJ_EXTRACT_AGENT=a1 "$BIN" 2>&1)"
+M2_ID="$(echo "$M2_RESULT" | grep 'session a1 ' | grep -oE 'change [0-9a-z]+' | head -1 | awk '{print $2}')"
+ok "cyclic session dependency produces the expected extracted conflict fixture" \
+  "[ -n '$M2_ID' ] && is_conflict '$M2_ID'"
+ok "conflicted extraction does not propagate into live @" \
+  "! is_conflict @ && grep -q '^A1-LATER$' f.txt"
+
 echo "== N: one undo reverses one complete extraction =="
 new_repo n
 edit a1 f.txt $'l1\nl2\nl3\nUNDO-LINE\n'
@@ -283,6 +335,23 @@ PATH="$FAKE_BIN:$PATH" edit a1 f.txt $'l1\nl2\nl3\nNO-SUBPROCESS\n'
 BUILT="$(PATH="$FAKE_BIN:$PATH" "$BIN" --all 2>&1)"
 ok "recording and extraction do not spawn jj" \
   "[ ! -e '$JJ_SPAWN_MARKER' ] && has '$(cid a1)' NO-SUBPROCESS"
+
+echo "== Q: same-session extraction on another base creates a distinct change =="
+new_repo q
+COMMON_BASE="$(jj log -r @- --no-graph -T 'change_id.short()')"
+edit a1 f.txt $'l1\nl2\nl3\nFIRST-LINE\n'
+FIRST_ID="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
+jj new "$COMMON_BASE" >/dev/null 2>&1
+printf 'branch base\n' >branch.txt
+jj file track branch.txt >/dev/null 2>&1
+jj describe -m branch-base >/dev/null 2>&1
+jj new >/dev/null 2>&1
+edit a1 f.txt $'l1\nl2\nl3\nSECOND-LINE\n'
+SECOND_ID="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
+ok "a same-session extraction on another base gets a new change id" \
+  "[ -n '$FIRST_ID' ] && [ -n '$SECOND_ID' ] && [ '$FIRST_ID' != '$SECOND_ID' ]"
+ok "the extraction on the first line is left unchanged" \
+  "has '$FIRST_ID' FIRST-LINE && nothas '$FIRST_ID' SECOND-LINE"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

@@ -13,7 +13,6 @@ use jj_lib::matchers::{FilesMatcher, NothingMatcher};
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPathBuf;
-use jj_lib::revset::{RevsetExpression, RevsetStreamExt as _};
 use jj_lib::settings::{HumanByteSize, UserSettings};
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::workspace::Workspace;
@@ -29,6 +28,8 @@ pub struct Jj {
 pub struct Evolution {
     pub commit: String,
     pub user: String,
+    /// Whether jj marked this evolution as a pure working-copy snapshot.
+    pub is_snapshot: bool,
 }
 
 impl Jj {
@@ -180,39 +181,14 @@ impl Jj {
                     .map(|op| op.metadata().username.clone())
                     .filter(|user| !user.is_empty())
                     .unwrap_or_else(|| neutral.to_string()),
+                is_snapshot: entry
+                    .operation
+                    .as_ref()
+                    .is_some_and(|op| op.metadata().is_snapshot),
             })
             .collect::<Vec<_>>();
         evolutions.reverse();
         Ok(evolutions)
-    }
-
-    /// Visible commits whose description contains `needle`.
-    pub fn commits_with_description(&self, needle: &str) -> Result<Vec<String>, String> {
-        pollster::block_on(self.commits_with_description_async(needle))
-    }
-
-    async fn commits_with_description_async(&self, needle: &str) -> Result<Vec<String>, String> {
-        let settings = settings(&self.root, None)?;
-        let workspace = self.load_workspace(&settings)?;
-        let repo = workspace
-            .repo_loader()
-            .load_at_head()
-            .await
-            .map_err(|e| format!("could not load the jj repository: {e}"))?;
-        let revset = RevsetExpression::all()
-            .evaluate(repo.as_ref())
-            .map_err(|e| format!("could not evaluate visible commits: {e}"))?;
-        let commits: Vec<_> = revset
-            .stream()
-            .commits(repo.store())
-            .try_collect()
-            .await
-            .map_err(|e| format!("could not read visible commits: {e}"))?;
-        Ok(commits
-            .into_iter()
-            .filter(|commit| commit.description().contains(needle))
-            .map(|commit| commit.id().hex())
-            .collect())
     }
 
     fn load_workspace(&self, settings: &UserSettings) -> Result<Workspace, String> {
