@@ -32,7 +32,8 @@ a separate branch for the session.
 ## Rules
 
 - Edit normally; recording is automatic for Codex `apply_patch` and supported
-  Claude Code file tools.
+  Claude Code file tools, and for a Claude Code Bash call whose only effect is
+  writing files.
 - Run `jj extract` after a coherent chunk of work, before handing it off.
 - Describe the extracted change with `jj describe`. `jj extract` takes no `-m`
   and writes no description of its own; it never overwrites one already there.

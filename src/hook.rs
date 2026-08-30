@@ -2,10 +2,12 @@
 //! edit as an agent-tagged jj snapshot; jj's evolog is the attributed ledger.
 //! Recording is automatic, so `jj extract` can pull any session's edits later.
 //!
-//! Only Claude's file tools and Codex's `apply_patch` are hooked — a Bash/other
-//! tool's file effects are never collected. They're flushed to an *unattributed*
-//! evolution by the neutral pre-snapshot, so they can't fold into an agent's
-//! change.
+//! Claude's file tools and Codex's `apply_patch` are hooked, and so is a Bash
+//! call that does nothing but write files (see [`crate::shell`]) — agents create
+//! files with `cat > f <<'EOF'` and inline scripts as readily as with `Write`.
+//! Every other tool's file effects are never collected: they're flushed to an
+//! *unattributed* evolution by the neutral pre-snapshot, so they can't fold into
+//! an agent's change.
 //!
 //! An edit never starts *tracking* a file: only the paths the tool creates are
 //! offered to the snapshot as trackable (see [`crate::new_files`]), so a file the
@@ -30,6 +32,14 @@ use crate::new_files;
 use crate::paths::{central_root, find_repo_root, relpath_within};
 
 const FILE_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "apply_patch"];
+const SHELL_TOOL: &str = "Bash";
+
+/// A tool call this hook records: which agent product made it, and the paths it
+/// names as targets.
+struct Recorded {
+    kind: Option<&'static str>,
+    targets: Vec<String>,
+}
 
 pub fn run_hook() -> i32 {
     let mut raw = String::new();
@@ -59,14 +69,14 @@ fn dispatch(payload: &Value) {
     if event != "PreToolUse" && event != "PostToolUse" {
         return;
     }
-    // Only file-editing tools; a Bash/other tool's effects are never collected.
     let tool = payload
         .get("tool_name")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if !FILE_TOOLS.contains(&tool) {
-        return;
-    }
+    let recorded = match recorded_call(tool, payload) {
+        Some(recorded) => recorded,
+        None => return,
+    };
 
     let cwd = payload
         .get("cwd")
@@ -95,8 +105,10 @@ fn dispatch(payload: &Value) {
         crate::lock::acquire(&state_dir, &agent);
         // Under that lock, note which targets don't exist yet: those, and only
         // those, are the files this edit may start tracking.
-        let creating: Vec<String> = edited_paths(payload, &|p| relpath_within(p, &root))
-            .into_iter()
+        let creating: Vec<String> = recorded
+            .targets
+            .iter()
+            .filter_map(|target| relpath_within(target, &root))
             .filter(|file| !root.join(file).exists())
             .collect();
         new_files::record(&state_dir, &agent, &creating);
@@ -108,13 +120,41 @@ fn dispatch(payload: &Value) {
     // snapshot always covers every tracked file; the paths only say what may
     // *become* tracked, so an edit to an untracked file leaves it untracked.
     let created = new_files::take(&state_dir, &agent);
-    jj.snapshot_tagged(&agent, identity::kind_of_tool(tool), &created);
+    jj.snapshot_tagged(&agent, recorded.kind, &created);
     crate::lock::release(&state_dir, &agent);
 }
 
-/// Extract repo-relative edited paths from Claude file-tool or Codex apply_patch
-/// payloads.
-fn edited_paths(payload: &Value, to_rel: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+/// What this tool call means for recording, or None when its file effects stay
+/// unattributed.
+fn recorded_call(tool: &str, payload: &Value) -> Option<Recorded> {
+    if FILE_TOOLS.contains(&tool) {
+        return Some(Recorded {
+            kind: identity::kind_of_tool(tool),
+            targets: edited_paths(payload),
+        });
+    }
+    if tool != SHELL_TOOL {
+        return None;
+    }
+    let input = payload.get("tool_input")?;
+    // A backgrounded command is still running when PostToolUse fires, so its
+    // writes would land in whatever evolution happens to come next.
+    if input
+        .get("run_in_background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let command = input.get("command").and_then(Value::as_str)?;
+    Some(Recorded {
+        kind: Some(identity::CLAUDE),
+        targets: crate::shell::written_paths(command)?,
+    })
+}
+
+/// Extract the paths named by Claude file-tool or Codex apply_patch payloads.
+fn edited_paths(payload: &Value) -> Vec<String> {
     let ti = match payload.get("tool_input") {
         Some(v) => v,
         None => return vec![],
@@ -152,11 +192,9 @@ fn edited_paths(payload: &Value, to_rel: &dyn Fn(&str) -> Option<String>) -> Vec
         }
     }
     let mut out: Vec<String> = vec![];
-    for p in raw {
-        if let Some(rel) = to_rel(&p) {
-            if !out.contains(&rel) {
-                out.push(rel);
-            }
+    for path in raw {
+        if !out.contains(&path) {
+            out.push(path);
         }
     }
     out
@@ -222,7 +260,7 @@ mod tests {
         });
 
         assert_eq!(
-            edited_paths(&payload, &|path| Some(path.to_string())),
+            edited_paths(&payload),
             ["src/main.rs", "src/cli.rs", "docs/usage.md", "old.txt"]
         );
     }

@@ -175,10 +175,19 @@ conflict between two snapshots from that session.
 - Automatic attribution covers Claude Code's `Edit`, `Write`, and `MultiEdit`
   tools and Codex's `apply_patch` tool, including add, update, delete, and move
   paths.
-- Changes made by Bash commands, formatters, humans, or other tools are recorded
-  neutrally and remain in live `@` when they commute cleanly with attributed
-  edits. An overlapping neutral rewrite may be adopted when a later attributed
-  edit on the same path causally depends on it.
+- It also covers a Bash call that does nothing but write files — a `cat > f
+  <<'EOF'` heredoc, a `tee`, an inline `python3 - <<'PY'` script — since agents
+  create and rewrite files that way as readily as with a file tool. Every part
+  of the command must be a write or a harmless read; one `git`, `cargo`, `rm`,
+  or unrecognized word anywhere in it, a backgrounded command, or an effect that
+  can't be read off the text (`$(...)`, a subshell) leaves the whole command
+  unattributed. Missing an edit only leaves those lines in live `@`; claiming
+  one wrongly would fold a formatter's sweep of the repository into an agent's
+  change.
+- Changes made by other Bash commands, formatters, humans, or other tools are
+  recorded neutrally and remain in live `@` when they commute cleanly with
+  attributed edits. An overlapping neutral rewrite may be adopted when a later
+  attributed edit on the same path causally depends on it.
 - An edit to an untracked file is not recorded: only a file an agent creates
   begins being tracked, so edits to ignored or deliberately untracked paths stay
   out of the repository and out of extracted changes.
@@ -211,9 +220,10 @@ with the underlying `jj config` error.
 
 **Nothing is extracted**
 
-Only supported file-tool edits made after hook installation are attributed.
-Check `jj evolog -r @` and the hook error log. Bash-created changes are omitted
-by design.
+Only supported edits made after hook installation are attributed: the file
+tools, and Bash calls that do nothing but write files. Check `jj evolog -r @`
+and the hook error log. Anything a broader shell command changed is omitted by
+design and stays in live `@`.
 
 ## Uninstall
 

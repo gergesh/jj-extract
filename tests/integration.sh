@@ -52,6 +52,18 @@ codex_hookev() { # EVENT SESSION OPERATION FILE
 codex_edit() { codex_hookev PreToolUse "$1" Update "$2"; printf '%s' "$3" >"$REPO/$2"; codex_hookev PostToolUse "$1" Update "$2"; }
 codex_add() { codex_hookev PreToolUse "$1" Add "$2"; printf '%s' "$3" >"$REPO/$2"; codex_hookev PostToolUse "$1" Add "$2"; }
 
+# A Claude Bash tool call. The command is written the way it travels in the hook
+# payload — one JSON string with \n for its newlines — and expanded to run.
+bash_hookev() { # EVENT SESSION JSON_COMMAND
+  printf '{"hook_event_name":"%s","cwd":"%s","session_id":"%s","tool_name":"Bash","tool_input":{"command":"%s"}}' \
+    "$1" "$REPO" "$2" "$3" | "$BIN" --hook
+}
+run_bash() { # SESSION JSON_COMMAND
+  bash_hookev PreToolUse "$1" "$2"
+  ( cd "$REPO" && eval "$(printf '%b' "$2")" ) >/dev/null 2>&1
+  bash_hookev PostToolUse "$1" "$2"
+}
+
 extract_all() { BUILT="$("$BIN" --all 2>&1)"; }
 cid() { echo "$BUILT" | grep "session $1 " | grep -oE 'change [0-9a-z]+' | head -1 | awk '{print $2}'; }
 addedlines() { jj diff -r "$1" --git 2>/dev/null | grep '^+' | grep -v '^+++'; }
@@ -402,6 +414,19 @@ ok "the author's own description survives re-extraction" \
   "desc '$ID2' | grep -q '^entirely my own words$'"
 ok "re-extraction creates no duplicate change"       "[ \"$(n_commits)\" = 3 ]"
 ok "the update carries both edits"                   "has '$ID2' ONE && has '$ID2' TOP"
+
+echo "== U: shell file writes are recorded like any other edit =="
+new_repo u
+jj config set --repo snapshot.auto-track 'none()' >/dev/null 2>&1
+run_bash a1 "cat > created.txt <<'EOF'\nFROM-A-HEREDOC\nEOF"
+run_bash a1 "python3 - <<'PY'\nfrom pathlib import Path\np = Path('f.txt')\np.write_text(p.read_text() + 'FROM-A-SCRIPT' + chr(10))\nPY"
+run_bash a1 "rm -f nothing.txt; echo NOT-SIMPLE >> f.txt"
+extract_all
+ok "a heredoc-created file is tracked and extracted" \
+  "has '$(cid a1)' FROM-A-HEREDOC && jj file list -r @ 2>/dev/null | grep -q created.txt"
+ok "an inline script's edit to a tracked file is extracted" "has '$(cid a1)' FROM-A-SCRIPT"
+ok "a command that does more than write files stays unattributed" \
+  "nothas '$(cid a1)' NOT-SIMPLE && jj diff -r @ --git | grep -q NOT-SIMPLE"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

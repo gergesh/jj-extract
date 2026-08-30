@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 /// so PostToolUse collects only that tool use's delta.
 const CLAUDE_REGISTRATIONS: [(&str, Option<&str>); 3] = [
     ("SessionStart", None),
-    ("PreToolUse", Some("Edit|Write|MultiEdit")),
-    ("PostToolUse", Some("Edit|Write|MultiEdit")),
+    ("PreToolUse", Some("Edit|Write|MultiEdit|Bash")),
+    ("PostToolUse", Some("Edit|Write|MultiEdit|Bash")),
 ];
 const CODEX_REGISTRATIONS: [(&str, Option<&str>); 2] = [
     ("PreToolUse", Some("^apply_patch$")),

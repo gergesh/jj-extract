@@ -21,6 +21,7 @@ mod jj_config;
 mod lock;
 mod new_files;
 mod paths;
+mod shell;
 
 use clap::{ArgGroup, Parser};
 use std::io::IsTerminal;

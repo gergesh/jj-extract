@@ -38,7 +38,7 @@ alone.
 ## Why
 
 Without it, your edits sit in the shared working copy mixed with other agents'
-(and any `jj`/Bash side-effects) and can't be told apart. `jj extract` pulls out
+(and any build, formatter, or `jj` side-effects) and can't be told apart. `jj extract` pulls out
 what you changed through your tools — even if you and another agent edited the
 same file in different places. Independent Bash changes stay unattributed; an
 overlapping rewrite that a later attributed edit depends on may move with it to
@@ -46,7 +46,9 @@ avoid a false conflict.
 
 ## Notes
 
-- Nothing to do up front — just edit; recording is automatic.
+- Nothing to do up front — just edit; recording is automatic. Writing a file
+  from the shell counts too (`cat > f <<'EOF'`, `tee`, an inline `python3 -`
+  script), as long as that is all the command does.
 - Describe the change yourself with `jj describe` once you can see the whole
   diff; there is no `-m` on `jj extract`.
 - `jj extract` is safe to run alongside other agents.
