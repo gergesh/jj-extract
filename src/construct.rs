@@ -6,7 +6,8 @@
 //! compose those deltas in memory, rewrite the extracted stack and the live
 //! working-copy commit once, then publish one operation. This keeps the operation
 //! log as the attribution ledger while making one `jj undo` reverse a complete
-//! extraction.
+//! extraction. A dry run composes every tree the same way and then stops: it
+//! publishes no operation and never touches the working copy.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -37,10 +38,16 @@ use crate::jj::{Evolution, Jj};
 
 pub struct Built {
     pub session: String,
-    pub change_id: String,
+    /// The change the session's edits landed in. `None` only for a dry run that
+    /// would create one: a change id is minted when the commit is written.
+    pub change_id: Option<String>,
     pub conflict: bool,
     /// True when this updated a prior extraction of the same session.
     pub updated: bool,
+    /// Paths the change contains, relative to its parent. Collected for a dry
+    /// run, whose report is the only view of a result that is never written;
+    /// after a real extraction `jj show` is that view, so it stays empty.
+    pub files: Vec<String>,
 }
 
 /// Operation attribute holding this tool's session -> extracted changes ledger.
@@ -118,6 +125,7 @@ pub fn extract(
     jj: &Jj,
     evolog: &[Evolution],
     targets: &[String],
+    dry_run: bool,
 ) -> Result<Vec<Built>, String> {
     let sessions = agents_in(evolog);
     let settings = jj.settings(
@@ -133,6 +141,7 @@ pub fn extract(
         &sessions,
         settings.user_name(),
         settings.user_email(),
+        dry_run,
     ))
 }
 
@@ -143,6 +152,7 @@ async fn extract_async(
     sessions: &[String],
     user_name: &str,
     user_email: &str,
+    dry_run: bool,
 ) -> Result<Vec<Built>, String> {
     let neutral = evolog
         .first()
@@ -196,9 +206,14 @@ async fn extract_async(
     }
 
     let old_live_tree = live.tree();
+    // The transaction is the unit of publication: nothing inside it reaches the
+    // repository until the `tx.commit()` below, which a dry run never makes.
     let mut tx = repo.start_transaction();
     tx.set_workspace_name(&workspace_name);
+    // The stack advances by content always and by commit only when we write, so
+    // a dry run stacks the same trees onto a tip it never parents anything to.
     let mut tip = base.clone();
+    let mut tip_tree = base.tree();
     let mut built = Vec::new();
 
     for session in sessions {
@@ -234,46 +249,75 @@ async fn extract_async(
                 continue;
             };
 
-        let stacked_tree = apply_delta(&tip.tree(), &delta_base, &delta_tree)
+        let stacked_tree = apply_delta(&tip_tree, &delta_base, &delta_tree)
             .await
             .map_err(|e| format!("could not stack session {session}: {e}"))?;
         let updated = prior.is_some();
-        let commit = if let Some(prior) = prior {
-            tx.repo_mut()
-                .rewrite_commit(&prior)
-                .set_parents(vec![tip.id().clone()])
-                .set_tree(stacked_tree)
-                .set_description(description)
-                .write()
-                .await
+        let written = if dry_run {
+            None
         } else {
-            tx.repo_mut()
-                .new_commit(vec![tip.id().clone()], stacked_tree)
-                .set_description(description)
-                .write()
-                .await
-        }
-        .map_err(|e| format!("could not write extracted session {session}: {e}"))?;
-
-        if prior_commits.len() > 1 {
-            for duplicate in prior_commits.drain(1..) {
-                tx.repo_mut().record_abandoned_commit(&duplicate);
+            let result = if let Some(prior) = &prior {
+                tx.repo_mut()
+                    .rewrite_commit(prior)
+                    .set_parents(vec![tip.id().clone()])
+                    .set_tree(stacked_tree.clone())
+                    .set_description(description)
+                    .write()
+                    .await
+            } else {
+                tx.repo_mut()
+                    .new_commit(vec![tip.id().clone()], stacked_tree.clone())
+                    .set_description(description)
+                    .write()
+                    .await
+            };
+            let commit =
+                result.map_err(|e| format!("could not write extracted session {session}: {e}"))?;
+            if prior_commits.len() > 1 {
+                for duplicate in prior_commits.drain(1..) {
+                    tx.repo_mut().record_abandoned_commit(&duplicate);
+                }
             }
-        }
+            Some(commit)
+        };
+
         if is_target {
-            let extracted = ledger.entry(session.clone()).or_default();
-            let change = commit.change_id().hex();
-            if !extracted.contains(&change) {
-                extracted.push(change);
+            if let Some(commit) = &written {
+                let extracted = ledger.entry(session.clone()).or_default();
+                let change = commit.change_id().hex();
+                if !extracted.contains(&change) {
+                    extracted.push(change);
+                }
             }
             built.push(Built {
                 session: session.clone(),
-                change_id: short_hex(commit.change_id().reverse_hex()),
-                conflict: commit.has_conflict(),
+                // A dry run can name the change it would update; one it would
+                // create has no id to name until the commit is written.
+                change_id: written
+                    .as_ref()
+                    .or(prior.as_ref())
+                    .map(|commit| short_hex(commit.change_id().reverse_hex())),
+                conflict: stacked_tree.has_conflict(),
                 updated,
+                files: if dry_run {
+                    changed_file_names(&tip_tree, &stacked_tree).await?
+                } else {
+                    Vec::new()
+                },
             });
         }
-        tip = commit;
+        if let Some(commit) = written {
+            tip = commit;
+        }
+        tip_tree = stacked_tree;
+    }
+
+    // A dry run ends here: the transaction is dropped uncommitted, so no
+    // operation is published and live `@` is never rewritten. The trees the
+    // merges produced stay in the store as unreferenced content, like every
+    // other computation jj abandons.
+    if dry_run {
+        return Ok(built);
     }
 
     let new_live = tx
@@ -432,6 +476,18 @@ async fn compose_session_tree(
         }
     }
     Ok(found.then_some(result))
+}
+
+/// The paths that differ between two trees, named the way a report shows them.
+async fn changed_file_names(
+    before: &MergedTree,
+    after: &MergedTree,
+) -> Result<Vec<String>, String> {
+    Ok(changed_paths(before, after)
+        .await?
+        .iter()
+        .map(|path| path.as_internal_file_string().to_owned())
+        .collect())
 }
 
 async fn changed_paths(

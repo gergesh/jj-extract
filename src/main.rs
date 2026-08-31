@@ -10,6 +10,7 @@
 //! Usage:
 //!   jj extract [-m MSG]           pull my edits into their own change
 //!   jj extract --all              build a change for every session in the evolog
+//!   jj extract --dry-run          report what that would build, changing nothing
 //!   jj-extract --install/--uninstall/--hook   agent integration plumbing
 
 mod construct;
@@ -44,14 +45,14 @@ struct Cli {
     #[arg(
         long,
         hide = true,
-        conflicts_with_all = ["install", "uninstall", "project", "all", "agent"]
+        conflicts_with_all = ["install", "uninstall", "project", "all", "agent", "dry_run"]
     )]
     hook: bool,
     /// Register Claude Code and Codex hooks, plus `jj extract` as a jj alias.
-    #[arg(long, conflicts_with_all = ["all", "agent"])]
+    #[arg(long, conflicts_with_all = ["all", "agent", "dry_run"])]
     install: bool,
     /// Remove the hooks and the jj alias.
-    #[arg(long, conflicts_with_all = ["all", "agent"])]
+    #[arg(long, conflicts_with_all = ["all", "agent", "dry_run"])]
     uninstall: bool,
     /// With --install/--uninstall: target this repo's hook configs, not global ones.
     #[arg(long, requires = "management")]
@@ -62,6 +63,9 @@ struct Cli {
     /// Session to extract (default: the current agent's exported session identity).
     #[arg(long)]
     agent: Option<String>,
+    /// Report what extraction would build, without changing the repository.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 fn main() {
@@ -73,7 +77,7 @@ fn main() {
     } else if cli.uninstall {
         cmd_uninstall(cli.project)
     } else {
-        cmd_extract(cli.agent, cli.all)
+        cmd_extract(cli.agent, cli.all, cli.dry_run)
     };
     exit(code);
 }
@@ -81,7 +85,7 @@ fn main() {
 // --------------------------------------------------------------------------- //
 // extract — the one command agents use
 // --------------------------------------------------------------------------- //
-fn cmd_extract(agent_opt: Option<String>, all: bool) -> i32 {
+fn cmd_extract(agent_opt: Option<String>, all: bool, dry_run: bool) -> i32 {
     let root = match repo_root() {
         Some(r) => r,
         None => {
@@ -117,7 +121,7 @@ fn cmd_extract(agent_opt: Option<String>, all: bool) -> i32 {
         vec![agent]
     };
 
-    let built = match construct::extract(&root, &jj, &evolog, &targets) {
+    let built = match construct::extract(&root, &jj, &evolog, &targets, dry_run) {
         Ok(built) => built,
         Err(e) => {
             err(&format!("Extraction stopped: {e}"));
@@ -129,28 +133,73 @@ fn cmd_extract(agent_opt: Option<String>, all: bool) -> i32 {
         println!("Nothing to extract for the requested session(s).");
         return 0;
     }
-    for b in built {
-        if b.conflict {
-            println!(
-                "{} session {} → change {} (inspect: jj show {})",
-                yellow("⚠ extracted WITH CONFLICTS:"),
-                b.session,
-                b.change_id,
-                b.change_id
-            );
+    if dry_run {
+        println!("{}", dim("Dry run — the repository was not changed."));
+    }
+    for b in &built {
+        if dry_run {
+            report_preview(b);
         } else {
-            let verb = if b.updated {
-                green("↻ updated")
-            } else {
-                green("✓ extracted")
-            };
-            println!(
-                "{} session {} → change {} in stack (inspect: jj show {})",
-                verb, b.session, b.change_id, b.change_id
-            );
+            report_extraction(b);
         }
     }
     0
+}
+
+/// What extraction built. The change itself is the detail here, one `jj show`
+/// away, so the line points at it rather than restating it.
+fn report_extraction(b: &construct::Built) {
+    let change = b.change_id.as_deref().unwrap_or("?");
+    if b.conflict {
+        println!(
+            "{} session {} → change {change} (inspect: jj show {change})",
+            yellow("⚠ extracted WITH CONFLICTS:"),
+            b.session,
+        );
+    } else {
+        let verb = if b.updated {
+            green("↻ updated")
+        } else {
+            green("✓ extracted")
+        };
+        println!(
+            "{verb} session {} → change {change} in stack (inspect: jj show {change})",
+            b.session,
+        );
+    }
+}
+
+/// How many paths a preview names before it summarises the rest. A dry run is
+/// read to decide whether to run the real thing, so it has to be scannable.
+const PREVIEW_FILES: usize = 10;
+
+/// What extraction would build. There is nothing to inspect afterwards, so the
+/// report has to carry the shape of the result itself: which change it lands
+/// in, whether that change already exists, and what it would contain.
+fn report_preview(b: &construct::Built) {
+    let target = match &b.change_id {
+        Some(change) => format!("change {change}"),
+        None => "a new change".to_string(),
+    };
+    let verb = if b.conflict {
+        yellow("⚠ would extract WITH CONFLICTS:")
+    } else if b.updated {
+        green("↻ would update")
+    } else {
+        green("✓ would extract")
+    };
+    let n = b.files.len();
+    println!(
+        "{verb} session {} → {target} ({n} file{})",
+        b.session,
+        if n == 1 { "" } else { "s" }
+    );
+    for path in b.files.iter().take(PREVIEW_FILES) {
+        println!("    {path}");
+    }
+    if n > PREVIEW_FILES {
+        println!("    {}", dim(&format!("… and {} more", n - PREVIEW_FILES)));
+    }
 }
 
 // --------------------------------------------------------------------------- //
@@ -351,6 +400,9 @@ fn green(s: &str) -> String {
 fn yellow(s: &str) -> String {
     paint(s, "33")
 }
+fn dim(s: &str) -> String {
+    paint(s, "2")
+}
 fn paint(s: &str, code: &str) -> String {
     if std::io::stdout().is_terminal() {
         format!("\x1b[{code}m{s}\x1b[0m")
@@ -379,6 +431,8 @@ mod tests {
             vec!["jj-extract", "--all", "--agent", "ignored"],
             vec!["jj-extract", "--install", "--all"],
             vec!["jj-extract", "--hook", "--all"],
+            vec!["jj-extract", "--install", "--dry-run"],
+            vec!["jj-extract", "--hook", "--dry-run"],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }

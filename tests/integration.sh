@@ -428,6 +428,30 @@ ok "an inline script's edit to a tracked file is extracted" "has '$(cid a1)' FRO
 ok "a command that does more than write files stays unattributed" \
   "nothas '$(cid a1)' NOT-SIMPLE && jj diff -r @ --git | grep -q NOT-SIMPLE"
 
+echo "== V: a dry run previews the extraction and changes nothing =="
+new_repo v
+edit a1 f.txt $'l1\nl2\nl3\nDRY-ONE\n'
+edit a1 g.txt $'DRY-TWO\n'
+LIVE_ID_BEFORE="$(jj log -r @ --no-graph -T 'change_id.short()')"
+OP_BEFORE="$(op_id)"
+PREVIEW="$(JJ_EXTRACT_AGENT=a1 "$BIN" --dry-run 2>&1)"
+ok "a dry run says the repository was not changed" \
+  "echo \"\$PREVIEW\" | grep -q 'Dry run'"
+ok "a dry run names the session and the files it would extract" \
+  "echo \"\$PREVIEW\" | grep -q 'would extract' && echo \"\$PREVIEW\" | grep -q 'session a1' && echo \"\$PREVIEW\" | grep -q 'f.txt' && echo \"\$PREVIEW\" | grep -q 'g.txt'"
+ok "a dry run publishes no operation" "[ \"$(op_id)\" = '$OP_BEFORE' ]"
+ok "a dry run builds no change" "[ \"$(n_extractions a1)\" = 0 ]"
+ok "a dry run leaves the live working-copy change untouched" \
+  "[ \"$(jj log -r @ --no-graph -T 'change_id.short()')\" = '$LIVE_ID_BEFORE' ] && echo \"\$(jj diff -r @ --git)\" | grep -q DRY-ONE"
+DRY_ID="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
+ok "the extraction that follows contains what the preview named" \
+  "has '$DRY_ID' DRY-ONE && has '$DRY_ID' DRY-TWO"
+UPDATE_PREVIEW="$(JJ_EXTRACT_AGENT=a1 "$BIN" --dry-run 2>&1)"
+ok "a dry run over an extracted session previews an update to its change" \
+  "echo \"\$UPDATE_PREVIEW\" | grep -q 'would update' && echo \"\$UPDATE_PREVIEW\" | grep -q 'change $DRY_ID'"
+ok "a dry run after extraction still leaves one change and one head" \
+  "[ \"$(n_extractions a1)\" = 1 ] && [ \"$(n_heads)\" = 1 ]"
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

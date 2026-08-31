@@ -87,11 +87,30 @@ Useful variants:
 ```bash
 jj extract --agent <session-id>  # extract an explicitly named session
 jj extract --all                 # extract every recorded session
+jj extract --dry-run             # report what that would build, changing nothing
 ```
 
 `--agent` is useful outside the originating agent process. In normal use,
 identity comes from `JJ_EXTRACT_AGENT`, `CLAUDE_CODE_SESSION_ID`, or
 `CODEX_THREAD_ID`.
+
+`--dry-run` reports the extraction instead of performing it: which change each
+session's edits would land in, whether that change already exists, which files
+it would contain, and whether stacking them would conflict. The preview is
+trustworthy because it is the real thing up to the last step — the same deltas
+composed through the same merges — stopping before the transaction is
+committed. No operation is published, no change is written, and `@` is left
+exactly as it was. A change that does not exist yet is reported as `a new
+change` rather than by ID, because a change ID is minted when its commit is
+written. It combines with `--agent` and `--all`.
+
+```console
+$ jj extract --dry-run
+Dry run — the repository was not changed.
+✓ would extract session 2fb... → a new change (2 files)
+    src/install.rs
+    README.md
+```
 
 After extraction, the shared live working-copy change remains checked out and its
 files are unchanged. Extracted changes are inserted as a chronological stack
