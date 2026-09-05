@@ -322,7 +322,25 @@ scripts/check.sh
 ```
 
 It checks formatting, runs Clippy with warnings denied, executes the Rust unit
-tests, rebuilds the real binary, and then runs the shell integration suite.
+tests, rebuilds the real binary, and then runs the shell integration suite and
+the five-agent formatting stress test.
+
+The stress test uses five concurrent hook clients editing shared Rust files,
+with real `rustfmt` sweeps at varying widths between randomly sized batches of
+edits. All sessions remain active across formatting and mid-task extraction.
+It also introduces a five-session dependency chain that requires moving existing
+changes, then re-extracts each session individually. It verifies semantic
+ownership, stable IDs, unchanged live trees and file bytes, operation atomicity,
+and the absence of conflicts without `--allow-conflicts`. Formatting is scheduled
+between file-tool windows; simultaneous unsynchronized writes to the same bytes
+are not modeled. Seeds 7, 42, and 99 run by default; a failure prints the actual
+edit/format order, including the order in which competing hooks acquired the lock.
+
+To run or reproduce a stress-test seed:
+
+```bash
+python3 tests/parallel_formatting.py --seed 42
+```
 
 The integration suite drives synthetic Claude Code and Codex hook JSON through
 the real binary and currently covers:

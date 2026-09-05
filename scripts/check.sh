@@ -10,3 +10,4 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 cargo build --locked
 tests/integration.sh
+python3 tests/parallel_formatting.py
