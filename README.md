@@ -113,8 +113,9 @@ Dry run — the repository was not changed.
 ```
 
 After extraction, the shared live working-copy change remains checked out and its
-files are unchanged. Extracted changes are inserted as a chronological stack
-between the original base and live `@`; the live change is rebased on top while
+files are unchanged. Extracted changes are inserted as a linear stack
+between the original base and live `@`; extraction chooses their order by
+replaying the edits and testing for conflicts. The live change is rebased on top while
 its exact pre-extraction tree is preserved. Each stack entry's diff contains
 that session's edits, while independent edits that were not attributed remain
 in `@`.
@@ -151,9 +152,52 @@ Re-extraction updates an existing session change only on the same stable
 extraction base. The same session extracted from another branch line receives a
 distinct change ID instead of rewriting the earlier line.
 
-If two sessions edit the same lines, jj may produce a conflict. `jj-extract`
-reports that explicitly and leaves the conflict in the extracted change for
-normal jj conflict resolution.
+Both extraction and dry run print the chosen order, including existing session
+changes that are moved or rewritten. Change IDs and descriptions survive a move.
+
+### Conflict reduction
+
+First-edit time is a preference, not a fixed position. For example, X can create
+an unrelated file, Y can introduce a function, and X can then modify that
+function. X started first, but the clean stack is **Y → X → live @**.
+Re-extracting X can move its existing change above Y without creating a new ID.
+
+The planner first tries chronological order. If any entry conflicts, it searches
+alternative orders, replaying each session directly onto its candidate parent.
+It scores conflicted paths across **every intermediate change**, so a clean tip
+cannot hide a conflicted parent. The search keeps up to 32 candidate prefixes and
+tries at most 4,096 additional session replays; it retains the best complete
+stack found. This is deterministic and bounded, rather than an exhaustive
+permutation search for large stacks. Dry runs use precisely the same planner.
+
+Formatting is expendable when it would introduce a conflict:
+
+- Word-level merges separate independent edits to different parts of one line.
+- Neutral formatter context is found across intervening edits by other sessions,
+  and carried only on paths the session subsequently touches.
+- A conflicting neutral rewrite is replayed partially for ordinary text files:
+  clean hunks provide context, while conflicting hunks keep the destination's
+  content. This can discard formatting that depends on another agent's code.
+- Cleanup removes only context actually introduced during replay, independently
+  per file. Context already owned by the parent is not subtracted again.
+- Files still conflicted after contextual replay are also tried without neutral
+  context; a clean result wins over retaining that optional rewrite.
+
+These rules apply to optional neutral context. Attributed edits still use full
+three-way merges; extraction never resolves a disagreement between agents by
+arbitrarily choosing one agent's code. The partial-context fallback is limited
+to regular text files of at most 1 MiB per input, with unchanged executable bits
+and copy identity. Binary, symlink, add/delete, and pre-existing conflicts retain
+ordinary jj merge behavior. Whitespace inside strings or indentation-sensitive
+code is not globally stripped or normalized.
+
+Some dependencies cannot fit into one change per session. If X changes a value,
+Y replaces it, and X replaces Y's value again, the history needs **X → Y → X**;
+neither two-change order necessarily works. A dependency on an unextracted
+session can also remain unresolved: `--agent` reorders existing extractions but
+does not silently extract new sessions. `--all` makes all recorded sessions
+available for placement. Remaining conflicts are reported explicitly for normal
+jj resolution, and live `@` retains its exact clean tree if it was clean before.
 
 ## How recording works
 
@@ -166,7 +210,7 @@ PreToolUse                         PostToolUse
 
 `jj extract`
   read @'s evolutions → replay with causal context → remove commuting neutral edits
-  → stack session changes → preserve live @'s exact tree on top
+  → search stack placements → preserve live @'s exact tree on top
 ```
 
 Recording never starts tracking a file. Each snapshot covers every path jj
@@ -183,7 +227,7 @@ post-hook cannot permanently block later edits.
 Extraction uses content-addressed snapshots and jj's three-way merge rather than
 remembering line numbers. That keeps attribution correct when another session
 inserts or deletes lines earlier in the same file. If a neutral formatter or
-shell rewrite touches a path immediately before the agent edits it, extraction
+shell rewrite touches a path before the agent edits it, extraction
 temporarily carries that rewrite as causal context. It removes the neutral delta
 again when it commutes cleanly; if removing it would itself conflict, the
 overlapping rewrite is adopted into the session instead of manufacturing a
@@ -275,6 +319,11 @@ the real binary and currently covers:
 - stable, duplicate-free re-extraction;
 - a single linear head with no divergent change IDs;
 - conflict-free stacking of causally dependent session edits;
+- automatic reordering of late dependencies, including create/delete edits;
+- moving an existing change while preserving its ID, description, and undo;
+- word-level composition and partial replay of optional formatter context;
+- neutral context across intervening sessions and independent per-file cleanup;
+- deterministic planning and explicit reporting of unavoidable dependency cycles;
 - automatic linearization of legacy sibling extraction heads;
 - single-operation extraction and re-extraction with one-step `jj undo`;
 - operation with no `jj` executable available to the jj-extract process;
@@ -293,6 +342,7 @@ Source layout:
 
 - `src/hook.rs` records attributed snapshots.
 - `src/construct.rs` reconstructs isolated changes.
+- `src/neutral.rs` replays the clean hunks of optional neutral context.
 - `src/jj.rs` records and reads repository state through `jj-lib`.
 - `src/jj_config.rs` manages jj-extract's owned user-config fragment.
 - `src/install.rs` safely merges and removes Claude Code and Codex hooks.

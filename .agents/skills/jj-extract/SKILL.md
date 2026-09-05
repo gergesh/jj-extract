@@ -25,9 +25,10 @@ jj show <change-id>
 jj describe -r <change-id> -m "<what changed and why>"
 ```
 
-Use the printed change id for review or handoff. Extracted session changes stay
-in first-edit order as a linear stack below the live working copy; do not create
-a separate branch for the session.
+Use the printed change id for review or handoff. Extracted session changes form
+a linear stack below the live working copy. The tool can reorder them to avoid
+conflicts, including moving an existing change while preserving its ID. Read the
+printed placement; do not assume first-edit order or create a separate branch.
 
 ## Rules
 
@@ -45,5 +46,8 @@ a separate branch for the session.
   path when separating them would create a conflict.
 - If `jj extract` reports conflicts, inspect the printed change with `jj show`
   and report the conflict instead of hiding it.
+- Formatting can be dropped or adopted to avoid conflicts. The tool uses
+  word-level merging and optional neutral context, but preserves real conflicts
+  between attributed edits. Cyclic dependencies may still require resolution.
 - If the command is unavailable, continue working normally and mention that the
   integration is not installed.

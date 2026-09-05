@@ -20,9 +20,10 @@ jj extract
 ```
 
 That reconstructs a jj change containing your attributed edits and prints its
-id. Extracted session changes are kept in first-edit order as a linear stack
-below the live working copy, so the command does not leave a sibling branch per
-agent.
+id. Extracted session changes form a linear stack below the live working copy.
+The tool can reorder them to avoid conflicts, including moving an existing
+change while preserving its ID. Read the printed placement rather than assuming
+first-edit order.
 
 Then describe it — after looking at what actually landed in it, not from memory:
 
@@ -58,5 +59,9 @@ avoid a false conflict.
   on the same path when separating them would create a conflict.
 - `jj extract --all` builds a change for every session (for whoever is collecting
   everyone's work).
+- Formatting can be dropped or adopted to avoid conflicts. The tool uses
+  word-level merging and optional neutral context, but preserves real conflicts
+  between attributed edits. If a cycle or another conflict remains, inspect the
+  printed change with `jj show` and report it rather than hiding it.
 - If `jj-extract` isn't installed (no `jj extract` command), ignore this and work
   normally.

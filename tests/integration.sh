@@ -452,6 +452,144 @@ ok "a dry run over an extracted session previews an update to its change" \
 ok "a dry run after extraction still leaves one change and one head" \
   "[ \"$(n_extractions a1)\" = 1 ] && [ \"$(n_heads)\" = 1 ]"
 
+echo "== W: an early-starting session can belong above a later session =="
+new_repo w
+edit early own.txt $'EARLY-OWN\n'
+edit later f.txt $'l1\nLATER\nl3\n'
+edit early f.txt $'l1\nEARLY-FINAL\nl3\n'
+OP_BEFORE="$(op_id)"
+PREVIEW="$("$BIN" --all --dry-run 2>&1)"
+ok "order search is also used by dry run without publishing" \
+  "! echo \"\$PREVIEW\" | grep -q CONFLICT && [ \"$(op_id)\" = '$OP_BEFORE' ]"
+extract_all
+ok "dependent early starter is placed after its prerequisite" \
+  "[ \"$(jj log -r "$(cid early)-" --no-graph -T 'change_id.short()')\" = '$(cid later)' ]"
+ok "reordered changes are clean and keep their own edits" \
+  "! is_conflict '$(cid early)' && ! is_conflict '$(cid later)' && has '$(cid early)' EARLY-FINAL && has '$(cid later)' LATER"
+ok "reordering preserves the exact live tree and one head" \
+  "[ -z \"$(jj diff -r @ --summary)\" ] && [ \"$(n_heads)\" = 1 ] && [ \"$(n_divergent)\" = 0 ]"
+
+echo "== W2: updating an extracted session can move its existing change =="
+new_repo w2
+edit early own.txt $'EARLY-OWN\n'
+EARLY_ID="$(JJ_EXTRACT_AGENT=early extract_one early)"
+jj describe -r "$EARLY_ID" -m 'Keep my description' >/dev/null 2>&1
+edit later f.txt $'l1\nLATER\nl3\n'
+LATER_ID="$(JJ_EXTRACT_AGENT=later extract_one later)"
+edit early f.txt $'l1\nEARLY-FINAL\nl3\n'
+OP_BEFORE="$(op_id)"
+MOVED_ID="$(JJ_EXTRACT_AGENT=early extract_one early)"
+ok "re-extraction moves the same change above its new prerequisite" \
+  "[ '$MOVED_ID' = '$EARLY_ID' ] && [ \"$(jj log -r "$MOVED_ID-" --no-graph -T 'change_id.short()')\" = '$LATER_ID' ] && ! is_conflict '$MOVED_ID'"
+ok "moving preserves descriptions and is one undoable operation" \
+  "desc '$MOVED_ID' | grep -q '^Keep my description$' && [ \"$(op_parent)\" = '$OP_BEFORE' ]"
+jj undo >/dev/null 2>&1
+ok "undo restores the earlier placement and content" \
+  "[ \"$(jj log -r "$LATER_ID-" --no-graph -T 'change_id.short()')\" = '$EARLY_ID' ] && nothas '$EARLY_ID' EARLY-FINAL"
+
+echo "== X: neutral context survives an intervening unrelated session =="
+new_repo x
+codex_add a1 picker.ts $'const picker={hour:19}\n'
+printf 'const picker = { hour: 19 }\n' >picker.ts
+codex_add a2 other.txt $'OTHER-AGENT\n'
+codex_edit a1 picker.ts $'const picker = { hour: 20 }\n'
+extract_all
+ok "formatter context is found across another session's edit" \
+  "! is_conflict '$(cid a1)' && has '$(cid a1)' '20' && nothas '$(cid a1)' OTHER-AGENT"
+
+echo "== Y: separate words on the same line do not force a conflict =="
+new_repo y
+printf 'const x = 1; const y = 2;\n' >code.ts
+jj file track code.ts >/dev/null 2>&1
+jj describe -m code-base >/dev/null 2>&1
+jj new >/dev/null 2>&1
+codex_edit a1 code.ts $'const x = 3; const y = 2;\n'
+codex_edit a2 code.ts $'const x = 3; const y = 4;\n'
+codex_edit a1 code.ts $'const x = 5; const y = 4;\n'
+extract_all
+ok "word-level composition preserves independent same-line edits" \
+  "! is_conflict '$(cid a1)' && ! is_conflict '$(cid a2)' && has '$(cid a1)' 'x = 5; const y = 2' && has '$(cid a2)' 'x = 5; const y = 4'"
+ok "same-line edits leave no residual in live @" "[ -z \"$(jj diff -r @ --summary)\" ]"
+
+echo "== Z: optional formatter context must not manufacture a dependency =="
+new_repo z
+printf 'const x = 1;\nconst y = 2;\n' >code.ts
+jj file track code.ts >/dev/null 2>&1
+jj describe -m code-base >/dev/null 2>&1
+jj new >/dev/null 2>&1
+codex_edit a1 code.ts $'const x = 3;\nconst y = 2;\n'
+codex_edit a2 code.ts $'const x = 3;\nconst other = 9;\n'
+printf 'const x=3;\nconst other=9;\n' >code.ts
+codex_edit a1 code.ts $'const x=5;\nconst other=9;\n'
+BUILT="$(JJ_EXTRACT_AGENT=a1 "$BIN" 2>&1)"
+ok "optional formatting is dropped when it needs an unextracted session" \
+  "! is_conflict '$(cid a1)' && has '$(cid a1)' '5' && nothas '$(cid a1)' other"
+ok "the omitted session remains in the live diff" \
+  "jj diff -r @ --git | grep -q other && [ \"$(n_extractions a2)\" = 0 ]"
+
+echo "== Z2: three dependencies can reverse the entire first-edit order =="
+new_repo z2
+edit a own-a.txt $'A\n'
+edit b own-b.txt $'B\n'
+edit c f.txt $'l1\nC-VALUE\nl3\n'
+edit b f.txt $'l1\nB-VALUE\nl3\n'
+edit a f.txt $'l1\nA-VALUE\nl3\n'
+extract_all
+ok "the planner finds c -> b -> a" \
+  "[ \"$(jj log -r "$(cid a)-" --no-graph -T 'change_id.short()')\" = '$(cid b)' ] && [ \"$(jj log -r "$(cid b)-" --no-graph -T 'change_id.short()')\" = '$(cid c)' ]"
+ok "every intermediate change in the reversed stack is clean" \
+  "! is_conflict '$(cid a)' && ! is_conflict '$(cid b)' && ! is_conflict '$(cid c)' && [ -z \"$(jj diff -r @ --summary)\" ]"
+ORDER_BEFORE="$(jj log -r 'ancestors(@) ~ root()' --no-graph -T 'change_id.short() ++ "\n"')"
+extract_all
+ok "replanning is deterministic and preserves all change identities" \
+  "[ \"$(jj log -r 'ancestors(@) ~ root()' --no-graph -T 'change_id.short() ++ "\n"')\" = '$ORDER_BEFORE' ] && [ \"$(n_divergent)\" = 0 ]"
+
+echo "== Z3: neutral cleanup is independent for each file =="
+new_repo z3
+edit a1 created.txt $'ORIGINAL\n'
+printf 'NEUTRAL-REPLACEMENT\n' >created.txt
+printf 'l1\nl2\nl3\nFOREIGN\n' >f.txt
+hookev PreToolUse a1 created.txt
+printf 'AGENT-FINAL\n' >created.txt
+printf 'TOP\nl1\nl2\nl3\nFOREIGN\n' >f.txt
+hookev PostToolUse a1 created.txt
+extract_all
+ok "dependent neutral rewrite is retained only where needed" \
+  "! is_conflict '$(cid a1)' && has '$(cid a1)' AGENT-FINAL && has '$(cid a1)' TOP && nothas '$(cid a1)' FOREIGN"
+ok "cleanly removable neutral content remains live" \
+  "jj diff -r @ --git | grep -q FOREIGN"
+
+echo "== Z4: creation and deletion dependencies also determine placement =="
+new_repo z4
+edit early own.txt $'OWN\n'
+edit creator new.txt $'CREATED\n'
+edit early new.txt $'UPDATED\n'
+extract_all
+ok "a newly created file is available at the chosen parent" \
+  "! is_conflict '$(cid early)' && ! is_conflict '$(cid creator)' && has '$(cid creator)' CREATED && has '$(cid early)' UPDATED && [ -z \"$(jj diff -r @ --summary)\" ]"
+
+new_repo z4-delete
+edit early own.txt $'OWN\n'
+edit writer f.txt $'REPLACED\n'
+codex_hookev PreToolUse early Delete f.txt
+rm f.txt
+codex_hookev PostToolUse early Delete f.txt
+extract_all
+ok "a deletion moves above the edit whose contents it deletes" \
+  "! is_conflict '$(cid early)' && ! is_conflict '$(cid writer)' && [ \"$(jj log -r "$(cid early)-" --no-graph -T 'change_id.short()')\" = '$(cid writer)' ] && [ ! -e f.txt ] && [ -z \"$(jj diff -r @ --summary)\" ]"
+
+echo "== Z5: unavoidable cycles remain visible, including in dry runs =="
+new_repo z5
+edit a1 f.txt $'A1\nl2\nl3\n'
+edit a2 f.txt $'A2\nl2\nl3\n'
+edit a1 f.txt $'A1-LATER\nl2\nl3\n'
+PREVIEW="$("$BIN" --all --dry-run 2>&1)"
+extract_all
+ok "a real cycle is reported by both planning and extraction" \
+  "echo \"\$PREVIEW\" | grep -q CONFLICT && echo \"\$BUILT\" | grep -q CONFLICT && { is_conflict '$(cid a1)' || is_conflict '$(cid a2)'; }"
+ok "even an unavoidable cycle preserves the clean live working copy" \
+  "! is_conflict @ && grep -q '^A1-LATER$' f.txt && [ \"$(n_heads)\" = 1 ]"
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

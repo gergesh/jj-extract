@@ -48,6 +48,8 @@ pub struct Built {
     /// run, whose report is the only view of a result that is never written;
     /// after a real extraction `jj show` is that view, so it stays empty.
     pub files: Vec<String>,
+    /// The preceding session in the chosen stack, or the original base.
+    pub after_session: Option<String>,
 }
 
 /// Operation attribute holding this tool's session -> extracted changes ledger.
@@ -195,15 +197,34 @@ async fn extract_async(
     let mut ledger = read_ledger(repo.as_ref()).await?;
     let mut existing = existing_extractions(repo.as_ref(), &base, sessions, &ledger).await?;
 
-    let mut target_trees = HashMap::new();
-    for session in targets {
-        if let Some(tree) = compose_session_tree(store, &base, session, evolog).await? {
-            target_trees.insert(session.clone(), tree);
+    let mut plans = Vec::new();
+    for session in sessions {
+        let prior = existing.get(session).and_then(|commits| commits.first());
+        let edits = if targets.contains(session) {
+            recorded_edits(store, &base.tree(), session, evolog).await?
+        } else if let Some(prior) = prior {
+            vec![ReplayEdit {
+                before: prior
+                    .parent_tree(repo.as_ref())
+                    .await
+                    .map_err(|e| format!("could not read {session}'s prior parent tree: {e}"))?,
+                after: prior.tree(),
+                neutral: false,
+            }]
+        } else {
+            Vec::new()
+        };
+        if !edits.is_empty() {
+            plans.push(SessionPlan {
+                session: session.clone(),
+                edits,
+            });
         }
     }
-    if target_trees.is_empty() {
+    if !plans.iter().any(|plan| targets.contains(&plan.session)) {
         return Ok(Vec::new());
     }
+    let stack = plan_stack(&base.tree(), &plans).await?;
 
     let old_live_tree = live.tree();
     // The transaction is the unit of publication: nothing inside it reaches the
@@ -216,42 +237,15 @@ async fn extract_async(
     let mut tip_tree = base.tree();
     let mut built = Vec::new();
 
-    for session in sessions {
+    for (position, (&index, stacked_tree)) in stack.order.iter().zip(&stack.trees).enumerate() {
+        let session = &plans[index].session;
         let mut prior_commits = existing.remove(session).unwrap_or_default();
         let prior = prior_commits.first().cloned();
-        let (delta_base, delta_tree, description, is_target) =
-            if let Some(tree) = target_trees.get(session) {
-                (
-                    base.tree(),
-                    tree.clone(),
-                    // A change that already has a description keeps it:
-                    // re-extraction updates what the change contains, never the
-                    // words its author chose for it.
-                    prior
-                        .as_ref()
-                        .map(|commit| commit.description().to_owned())
-                        .filter(|description| !description.is_empty())
-                        .unwrap_or_else(|| {
-                            extraction_desc(session, kind_of(evolog, session).as_deref())
-                        }),
-                    true,
-                )
-            } else if let Some(commit) = &prior {
-                (
-                    commit.parent_tree(repo.as_ref()).await.map_err(|e| {
-                        format!("could not read {session}'s prior parent tree: {e}")
-                    })?,
-                    commit.tree(),
-                    commit.description().to_owned(),
-                    false,
-                )
-            } else {
-                continue;
-            };
-
-        let stacked_tree = apply_delta(&tip_tree, &delta_base, &delta_tree)
-            .await
-            .map_err(|e| format!("could not stack session {session}: {e}"))?;
+        // Reordering and re-extraction preserve the author's description.
+        let description = prior
+            .as_ref()
+            .map(|commit| commit.description().to_owned())
+            .unwrap_or_else(|| extraction_desc(session, kind_of(evolog, session).as_deref()));
         let updated = prior.is_some();
         let written = if dry_run {
             None
@@ -281,7 +275,7 @@ async fn extract_async(
             Some(commit)
         };
 
-        if is_target {
+        if targets.contains(session) {
             if let Some(commit) = &written {
                 let extracted = ledger.entry(session.clone()).or_default();
                 let change = commit.change_id().hex();
@@ -289,27 +283,32 @@ async fn extract_async(
                     extracted.push(change);
                 }
             }
-            built.push(Built {
-                session: session.clone(),
-                // A dry run can name the change it would update; one it would
-                // create has no id to name until the commit is written.
-                change_id: written
-                    .as_ref()
-                    .or(prior.as_ref())
-                    .map(|commit| short_hex(commit.change_id().reverse_hex())),
-                conflict: stacked_tree.has_conflict(),
-                updated,
-                files: if dry_run {
-                    changed_file_names(&tip_tree, &stacked_tree).await?
-                } else {
-                    Vec::new()
-                },
-            });
         }
+        // Existing entries are rewritten too. Report the entire chosen stack,
+        // including conflicts in a non-target entry that moved above a target.
+        built.push(Built {
+            session: session.clone(),
+            // A dry run can name the change it would update; one it would
+            // create has no id to name until the commit is written.
+            change_id: written
+                .as_ref()
+                .or(prior.as_ref())
+                .map(|commit| short_hex(commit.change_id().reverse_hex())),
+            conflict: stacked_tree.has_conflict(),
+            updated,
+            files: if dry_run {
+                changed_file_names(&tip_tree, stacked_tree).await?
+            } else {
+                Vec::new()
+            },
+            after_session: position
+                .checked_sub(1)
+                .map(|previous| plans[stack.order[previous]].session.clone()),
+        });
         if let Some(commit) = written {
             tip = commit;
         }
-        tip_tree = stacked_tree;
+        tip_tree = stacked_tree.clone();
     }
 
     // A dry run ends here: the transaction is dropped uncommitted, so no
@@ -412,70 +411,201 @@ async fn existing_extractions(
     Ok(existing)
 }
 
-async fn compose_session_tree(
+struct ReplayEdit {
+    before: MergedTree,
+    after: MergedTree,
+    neutral: bool,
+}
+
+struct SessionPlan {
+    session: String,
+    edits: Vec<ReplayEdit>,
+}
+
+/// Load history once, before trying alternative placements. Neutral snapshots
+/// are relevant even when another session edited an unrelated file in between.
+/// Walking backwards lets us carry only paths this session will subsequently
+/// touch, and excludes formatter sweeps after its last edit.
+async fn recorded_edits(
     store: &Arc<Store>,
-    base: &Commit,
+    base: &MergedTree,
     session: &str,
     evolog: &[Evolution],
-) -> Result<Option<MergedTree>, String> {
-    let mut result = base.tree();
+) -> Result<Vec<ReplayEdit>, String> {
     let neutral = evolog.first().map(|e| e.user.as_str()).unwrap_or("");
-    let mut carried_neutral = Vec::new();
-    let mut found = false;
-    for index in 1..evolog.len() {
-        if evolog[index].user != session {
+    let mut future_paths = BTreeSet::new();
+    let mut edits = Vec::new();
+    for index in (1..evolog.len()).rev() {
+        let evolution = &evolog[index];
+        let is_neutral = evolution.user == neutral && evolution.is_snapshot;
+        if evolution.user != session && (!is_neutral || future_paths.is_empty()) {
             continue;
         }
         let before = load_commit(store, &evolog[index - 1].commit)?;
-        let after = load_commit(store, &evolog[index].commit)?;
-
-        // A neutral snapshot between two edits from the same session can be
-        // causal context for the later edit (most commonly formatter output). Add
-        // only overlapping paths before replaying the attributed delta. We try
-        // to remove that context again after all attributed edits have been
-        // composed; if the inverse conflicts, the session depended on it and
-        // the context belongs with the extracted change.
-        let mut context_start = index - 1;
-        while context_start > 0
-            && evolog[context_start].user == neutral
-            && evolog[context_start].is_snapshot
-        {
-            context_start -= 1;
+        let after = load_commit(store, &evolution.commit)?;
+        let paths = changed_paths(&before.tree(), &after.tree()).await?;
+        if is_neutral {
+            let overlapping = paths.intersection(&future_paths).cloned().collect();
+            if !BTreeSet::is_empty(&overlapping) {
+                edits.push(ReplayEdit {
+                    before: paths_from(base, &before.tree(), &overlapping).await?,
+                    after: paths_from(base, &after.tree(), &overlapping).await?,
+                    neutral: true,
+                });
+            }
+        } else {
+            future_paths.extend(paths);
+            edits.push(ReplayEdit {
+                before: before.tree(),
+                after: after.tree(),
+                neutral: false,
+            });
         }
-        if context_start < index - 1 {
-            let context_before = load_commit(store, &evolog[context_start].commit)?;
-            let actual_paths = changed_paths(&before.tree(), &after.tree()).await?;
-            let neutral_paths = changed_paths(&context_before.tree(), &before.tree()).await?;
-            let overlapping_paths = neutral_paths
-                .intersection(&actual_paths)
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if !overlapping_paths.is_empty() {
-                let restricted_before =
-                    paths_from(&base.tree(), &context_before.tree(), &overlapping_paths).await?;
-                let restricted_after =
-                    paths_from(&base.tree(), &before.tree(), &overlapping_paths).await?;
-                result = apply_delta(&result, &restricted_before, &restricted_after)
-                    .await
-                    .map_err(|e| format!("could not replay causal context for {session}: {e}"))?;
-                carried_neutral.push((restricted_before, restricted_after));
+    }
+    edits.reverse();
+    Ok(edits)
+}
+
+async fn replay_session(parent: &MergedTree, plan: &SessionPlan) -> Result<MergedTree, String> {
+    let mut result = parent.clone();
+    let mut carried = Vec::new();
+    for edit in &plan.edits {
+        let merged = apply_delta(&result, &edit.before, &edit.after)
+            .await
+            .map_err(|e| format!("could not replay an edit for {}: {e}", plan.session))?;
+        let next = if edit.neutral && merged.has_conflict() {
+            crate::neutral::keep_clean_hunks(&result, &edit.before, &edit.after, &merged).await?
+        } else {
+            merged
+        };
+        if edit.neutral {
+            // Undo only context actually introduced here. The parent may
+            // already own some or all of the neutral rewrite.
+            carried.push((result, next.clone()));
+        }
+        result = next;
+    }
+    for (before, after) in carried.iter().rev() {
+        let candidate = apply_delta(&result, after, before)
+            .await
+            .map_err(|e| format!("could not remove neutral context for {}: {e}", plan.session))?;
+        // Retain only the paths whose inverse conflicts. One adopted rewrite
+        // must not drag unrelated neutral edits in another file along with it.
+        let mut removable = changed_paths(&result, &candidate).await?;
+        for (path, value) in candidate.conflicts() {
+            value.map_err(|e| format!("could not inspect neutral-context conflict: {e}"))?;
+            removable.remove(&path);
+        }
+        result = paths_from(&result, &candidate, &removable).await?;
+    }
+    if result.has_conflict() && !carried.is_empty() {
+        // Context is optional. A formatter can depend on an omitted agent even
+        // when this session's actual edits commute without the formatting.
+        let mut without_context = parent.clone();
+        for edit in plan.edits.iter().filter(|edit| !edit.neutral) {
+            without_context = apply_delta(&without_context, &edit.before, &edit.after)
+                .await
+                .map_err(|e| format!("could not replay without neutral context: {e}"))?;
+        }
+        // Choose per path, so optional formatting in one file cannot mask a
+        // necessary rewrite in another. Never replace a clean result with a
+        // conflicted one merely to preserve formatting.
+        let mut recoverable = BTreeSet::new();
+        for (path, value) in result.conflicts() {
+            value.map_err(|e| format!("could not inspect replay conflict: {e}"))?;
+            if without_context
+                .path_value(&path)
+                .await
+                .map_err(|e| format!("could not inspect replay without context: {e}"))?
+                .is_resolved()
+            {
+                recoverable.insert(path);
             }
         }
-        result = apply_delta(&result, &before.tree(), &after.tree())
-            .await
-            .map_err(|e| format!("could not compose a recorded edit for {session}: {e}"))?;
-        found = true;
+        result = paths_from(&result, &without_context, &recoverable).await?;
+    }
+    Ok(result)
+}
+
+#[derive(Clone, Default)]
+struct StackPlan {
+    order: Vec<usize>,
+    trees: Vec<MergedTree>,
+    /// Count every conflicted path at every stack entry, not just at the tip:
+    /// a later edit can resolve a conflict while leaving its parent broken.
+    conflicts: usize,
+}
+
+impl StackPlan {
+    async fn append(
+        &self,
+        base: &MergedTree,
+        plans: &[SessionPlan],
+        index: usize,
+    ) -> Result<Self, String> {
+        let tree = replay_session(self.trees.last().unwrap_or(base), &plans[index]).await?;
+        let mut result = self.clone();
+        for (_, value) in tree.conflicts() {
+            value.map_err(|e| format!("could not inspect planned conflict: {e}"))?;
+            result.conflicts += 1;
+        }
+        result.order.push(index);
+        result.trees.push(tree);
+        Ok(result)
+    }
+}
+
+/// Chronology is a cheap, deterministic preference, not a placement constraint.
+/// On conflict, search several prefixes in parallel so a locally clean choice
+/// cannot immediately lock us into a bad order. Replay at the actual candidate
+/// parent: reconstructing against the base first loses the dependency context.
+/// Work is bounded; a difficult cycle must not make extraction factorial.
+async fn plan_stack(base: &MergedTree, plans: &[SessionPlan]) -> Result<StackPlan, String> {
+    const BEAM_WIDTH: usize = 32;
+    const MAX_REPLAYS: usize = 4096;
+
+    let mut best = StackPlan::default();
+    for index in 0..plans.len() {
+        best = best.append(base, plans, index).await?;
+    }
+    if best.conflicts == 0 || plans.len() < 2 {
+        return Ok(best);
     }
 
-    for (before, after) in carried_neutral.into_iter().rev() {
-        let candidate = apply_delta(&result, &after, &before)
-            .await
-            .map_err(|e| format!("could not remove neutral context for {session}: {e}"))?;
-        if !candidate.has_conflict() {
-            result = candidate;
+    let mut beam = vec![StackPlan::default()];
+    let mut replays = 0;
+    for _ in 0..plans.len() {
+        let mut next = Vec::new();
+        for prefix in &beam {
+            for index in 0..plans.len() {
+                if prefix.order.contains(&index) {
+                    continue;
+                }
+                if replays == MAX_REPLAYS {
+                    return Ok(best);
+                }
+                replays += 1;
+                let candidate = prefix.append(base, plans, index).await?;
+                // Conflict costs can only grow along a prefix.
+                if candidate.conflicts < best.conflicts {
+                    if candidate.order.len() == plans.len() {
+                        best = candidate.clone();
+                        if best.conflicts == 0 {
+                            return Ok(best);
+                        }
+                    }
+                    next.push(candidate);
+                }
+            }
         }
+        next.sort_by(|a, b| (a.conflicts, &a.order).cmp(&(b.conflicts, &b.order)));
+        next.truncate(BEAM_WIDTH);
+        if next.is_empty() {
+            break;
+        }
+        beam = next;
     }
-    Ok(found.then_some(result))
+    Ok(best)
 }
 
 /// The paths that differ between two trees, named the way a report shows them.
@@ -563,6 +693,7 @@ fn extraction_settings(
         .and_then(|_| layer.set_value("user.email", user_email))
         .and_then(|_| layer.set_value("operation.username", operation_username))
         .and_then(|_| layer.set_value("operation.hostname", "jj-extract.local"))
+        .and_then(|_| layer.set_value("merge.hunk-level", "word"))
         .map_err(|e| format!("could not build jj-lib settings: {e}"))?;
     let mut config = StackedConfig::with_defaults();
     config.add_layer(layer);

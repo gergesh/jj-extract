@@ -20,6 +20,7 @@ mod install;
 mod jj;
 mod jj_config;
 mod lock;
+mod neutral;
 mod new_files;
 mod paths;
 mod shell;
@@ -141,6 +142,10 @@ fn cmd_extract(agent_opt: Option<String>, all: bool, dry_run: bool) -> i32 {
             report_preview(b);
         } else {
             report_extraction(b);
+        }
+        match &b.after_session {
+            Some(session) => println!("    after session {session}"),
+            None => println!("    after extraction base"),
         }
     }
     0
