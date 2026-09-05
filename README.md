@@ -14,7 +14,7 @@ $ jj describe -r yxw... -m "Improve install errors"
 There is no start or tracking command. Once the hooks are installed, recording
 is automatic. Each extraction creates a new change containing only edits since
 that session’s last extraction. With no new edits, it does nothing. Use
-`--amend` to add pending edits to the latest extracted change instead.
+`--squash` to add pending edits to the latest extracted change instead.
 
 ## Requirements
 
@@ -79,14 +79,14 @@ jj extract
 
 A new change starts with a `jj-extract: <session>` placeholder for its author to
 replace with `jj describe`, having read the change that was actually built. This placeholder is not used to find the
-change: descriptions can be replaced entirely, and `--amend` preserves them.
+change: descriptions can be replaced entirely, and `--squash` preserves them.
 
 Useful variants:
 
 ```bash
 jj extract --agent <session-id>  # extract an explicitly named session
 jj extract --all                 # create a new change for each session with pending edits
-jj extract --amend               # add pending edits to my latest extraction
+jj extract --squash              # squash pending edits into my latest extraction
 jj extract --dry-run             # report what that would build, changing nothing
 jj extract --allow-conflicts     # explicitly permit publishing conflicts
 ```
@@ -136,7 +136,7 @@ fails the command; one detected before publication aborts the transaction.
 Extraction is committed through `jj-lib` as one repository transaction, even
 when several session changes are built or updated. One `jj undo` therefore
 reverses one complete extraction and restores its pending edits. Undoing
-`--amend` restores the prior version of the amended change. Because the library
+`--squash` restores the prior version of the updated change. Because the library
 API is versioned with jj, jj-extract currently embeds `jj-lib` 0.44.0 and supports jj 0.44.x.
 Recording, evolution traversal, commit lookup, and extraction all use `jj-lib`
 directly; jj-extract never spawns the `jj` CLI. Installation writes its owned
@@ -148,41 +148,41 @@ false conflicts for causally dependent edits. Inspect an entry with the
 `jj show <change-id>` command printed in the result.
 
 If an older jj-extract release already left session changes as sibling heads,
-`--amend` linearizes those owned changes while preserving their change IDs.
+`--squash` linearizes those owned changes while preserving their change IDs.
 
 An extracted change is credited with the standard `Co-authored-by:` trailer the
 session's own agent writes — `Claude <noreply@anthropic.com>` for Claude Code,
 `Codex <noreply@openai.com>` for Codex — and nothing else. Which session a
 change was built for is recorded in the extraction operation's own metadata, not
 in the description, so `jj describe` is free to replace the text entirely: the
-next `--amend` can still locate the latest extraction. The operation log also
+next `--squash` can still locate the latest extraction. The operation log also
 records which edit snapshots have already been extracted. Previewing or refusing
 an extraction does not consume edits; undo restores the previous checkpoint.
 Renaming or manually squashing extracted changes does not replay their old edits.
 
-### Repeated extraction and amendment
+### Repeated extraction and squashing
 
 The default is additive. If X extracts, Y builds on X and extracts, and X edits
 again, the result is **X₁ → Y₁ → X₂ → live @**. X₂ contains only X’s new edits;
 X₁ and Y₁ keep their exact commits and descriptions. You can combine chunks later
 with `jj squash` when that is useful.
 
-`jj extract --amend` explicitly adds pending edits to the latest visible
+`jj extract --squash` explicitly adds pending edits to the latest visible
 extraction for the session on this extraction base. It preserves earlier chunks
 as separate changes, but may move or rebase existing extracted changes to find a
 clean order. Their change IDs and descriptions survive; their commit hashes can
-change. With no prior extraction, it creates the first change. `--all --amend`
-amends each session’s latest extraction. Amendment can also relinearize the stack
+change. With no prior extraction, it creates the first change. `--all --squash`
+updates each session’s latest extraction. Squashing can also relinearize the stack
 without new edits, so preview it when placement matters.
 
 Older releases did not record edit checkpoints. When a visible extraction lacks
-one, the default refuses to guess which historical edits are new. Run `--amend`
+one, the default refuses to guess which historical edits are new. Run `--squash`
 once for that session to establish its checkpoint, then use incremental
 extraction normally. This migration may reconstruct the older extraction from
-its recorded history; review it with `--amend --dry-run` first.
+its recorded history; review it with `--squash --dry-run` first.
 
 Both extraction and dry run print the chosen order. Existing changes are only
-moved or rewritten with `--amend`. Metadata follows the surviving evolution of
+moved or rewritten with `--squash`. Metadata follows the surviving evolution of
 the live working-copy change; discarded operation history cannot supply a lost
 checkpoint.
 
@@ -191,7 +191,7 @@ checkpoint.
 First-edit time is a preference, not a fixed position. For example, X can create
 an unrelated file, Y can introduce a function, and X can then modify that
 function. X started first, but the clean stack is **Y → X → live @**.
-Amending X can move its latest existing change above Y without creating a new ID.
+Squashing into X can move its latest existing change above Y without creating a new ID.
 Default extraction instead appends a new X chunk above the existing stack.
 
 The planner first tries chronological order. If any entry conflicts, it searches
@@ -356,9 +356,9 @@ The stress test uses five concurrent hook clients editing shared Rust files,
 with real `rustfmt` sweeps at varying widths between randomly sized batches of
 edits. Sweeps alternate between neutral and agent-attributed formatting. All
 sessions remain active across formatting and mid-task extraction.
-It runs both default incremental extraction and `--amend`, including a
+It runs both default incremental extraction and `--squash`, including a
 five-session dependency chain and subsequent individual extractions. It verifies
-semantic ownership, untouched earlier commits by default, stable amended IDs,
+semantic ownership, untouched earlier commits by default, stable IDs when squashing,
 unchanged live trees and file bytes, operation atomicity,
 and the absence of conflicts without `--allow-conflicts`. Formatting is scheduled
 between file-tool windows; simultaneous unsynchronized writes to the same bytes
@@ -379,7 +379,7 @@ the real binary and currently covers:
 - exclusion of non-tool changes;
 - single-session and all-session extraction;
 - composition of multiple edits and new files;
-- incremental chunks, no-op repeats, independent checkpoints, and latest-chunk amendment;
+- incremental chunks, no-op repeats, independent checkpoints, and squashing into the latest chunk;
 - checkpoint recovery after undo and manual squash;
 - a single linear head with no divergent change IDs;
 - conflict-free stacking of causally dependent session edits;

@@ -37,7 +37,7 @@ placement; do not assume first-edit order or create a separate branch.
   Claude Code file tools, and for a Claude Code Bash call whose only effect is
   writing files.
 - Run `jj extract` after a coherent chunk of work, before handing it off.
-- Use `--amend` only when intentionally adding pending edits to the session’s
+- Use `--squash` only when intentionally adding pending edits to the session’s
   latest extracted change. It may move or rebase earlier extracted changes to
   avoid conflicts. Default extraction preserves them exactly; chunks can be
   combined later with `jj squash`.

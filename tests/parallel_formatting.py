@@ -27,7 +27,7 @@ ROUNDS = 4
 
 
 class Scenario:
-    def __init__(self, directory, binary, seed, amend):
+    def __init__(self, directory, binary, seed, squash):
         self.root = Path(directory)
         self.binary = binary
         self.seed = seed
@@ -36,7 +36,7 @@ class Scenario:
                         JJ_EXTRACT_HOME=str(self.root / ".hook-state"))
         for name in ("JJ_EXTRACT_AGENT", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
             self.env.pop(name, None)
-        self.amend = amend
+        self.squash = squash
         self.ids = {}
         self.versions = {}
         self.pending = set()
@@ -130,8 +130,8 @@ class Scenario:
                              "-T", "self.id()")
         disk = {path: (self.root / path).read_bytes() for path in (*FORMATTED, "neutral.txt")}
         args = [self.binary, "--all"] if agent is None else [self.binary, "--agent", self.session(agent)]
-        if self.amend:
-            args.append("--amend")
+        if self.squash:
+            args.append("--squash")
         if preview:
             args.append("--dry-run")
         output = self.run(*args)
@@ -145,26 +145,26 @@ class Scenario:
                             "-T", "self.id()") == operation
             return
         selected = self.pending.copy() if agent is None else self.pending.intersection({agent})
-        if self.amend or selected:
+        if self.squash or selected:
             assert self.run("jj", "--ignore-working-copy", "op", "log", "--no-graph", "-n", "1",
                             "-T", 'self.parents().map(|p| p.id()).join("\\n")') == operation
         else:
             assert self.run("jj", "--ignore-working-copy", "op", "log", "--no-graph", "-n", "1",
                             "-T", "self.id()") == operation
-        if not self.amend:
+        if not self.squash:
             for change, version in self.versions.items():
                 assert self.run("jj", "log", "-r", change, "--no-graph", "-T", "commit_id") == version
         extracted = {}
         for index, change in re.findall(rf"session parallel-{self.seed}-(\d+) → change (\w+)", output):
             index = int(index)
-            if self.amend:
-                assert self.ids.get(index, change) == change, "amend changed an ID"
+            if self.squash:
+                assert self.ids.get(index, change) == change, "squash changed an ID"
             else:
                 assert change not in self.versions, "default reused an existing change"
             extracted[index] = change
             self.ids[index] = change
             self.versions[change] = self.run("jj", "log", "-r", change, "--no-graph", "-T", "commit_id")
-        if not self.amend:
+        if not self.squash:
             assert set(extracted) == selected, (extracted, selected)
         self.pending.difference_update(selected)
         for index, change in extracted.items():
@@ -209,7 +209,7 @@ class Scenario:
                     self.format()
                 (self.root / "neutral.txt").write_text(f"base\nHUMAN-{self.seed}\n")
                 # Continue editing after formatting, then extract mid-task so
-                # later edits exercise both incremental and amended extraction.
+                # later edits exercise both incremental and updated extraction.
                 if (sum(counts) >= 10 and not mid_extracted) or sum(counts) == AGENTS * ROUNDS:
                     self.extract(preview=True)
                     self.extract()
@@ -236,7 +236,7 @@ class Scenario:
         assert len(self.ids) == AGENTS
         assert self.values("@")[0] == dict(enumerate(self.expected))
         assert "neutral.txt" in self.run("jj", "diff", "-r", "@", "--summary")
-        mode = "amend" if self.amend else "incremental"
+        mode = "squash" if self.squash else "incremental"
         print(f"PASS: {mode}, seed {self.seed}, five concurrent agents, {AGENTS * (ROUNDS + 1)} code edits, "
               f"{self.formats} rustfmt sweeps; clean attribution, IDs and live tree", flush=True)
 
@@ -246,14 +246,14 @@ def main():
     parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/jj-extract")
     parser.add_argument("--seed", type=int, action="append", help="reproduce a specific schedule")
     args = parser.parse_args()
-    for amend in (False, True):
+    for squash in (False, True):
         for seed in args.seed or (7, 42, 99):
             with tempfile.TemporaryDirectory(prefix=f"jj-extract-five-{seed}-") as directory:
-                scenario = Scenario(directory, str(args.binary.resolve()), seed, amend)
+                scenario = Scenario(directory, str(args.binary.resolve()), seed, squash)
                 try:
                     scenario.exercise()
                 except Exception:
-                    print(f"Failed seed {seed}, amend={amend}; actual edit/format order:\n"
+                    print(f"Failed seed {seed}, squash={squash}; actual edit/format order:\n"
                           + "\n".join(scenario.history), flush=True)
                     raise
 

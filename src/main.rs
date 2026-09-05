@@ -10,7 +10,7 @@
 //! Usage:
 //!   jj extract                    pull my edits into their own change
 //!   jj extract --all              build new changes for sessions with pending edits
-//!   jj extract --amend            add pending edits to my latest extracted change
+//!   jj extract --squash           squash pending edits into my latest extracted change
 //!   jj extract --dry-run          report what that would build, changing nothing
 //!   jj-extract --install/--uninstall/--hook   agent integration plumbing
 
@@ -72,9 +72,9 @@ struct Cli {
     /// Permit extraction to publish conflicts (refused by default).
     #[arg(long, conflicts_with_all = ["install", "uninstall", "hook", "project"])]
     allow_conflicts: bool,
-    /// Add pending edits to this session's latest extracted change instead of creating a new one.
+    /// Squash pending edits into this session's latest extracted change.
     #[arg(long, conflicts_with_all = ["install", "uninstall", "hook", "project"])]
-    amend: bool,
+    squash: bool,
 }
 
 fn main() {
@@ -92,7 +92,7 @@ fn main() {
             construct::ExtractOptions {
                 dry_run: cli.dry_run,
                 allow_conflicts: cli.allow_conflicts,
-                amend: cli.amend,
+                squash: cli.squash,
             },
         )
     };

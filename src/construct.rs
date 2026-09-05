@@ -58,7 +58,7 @@ pub struct Built {
 pub struct ExtractOptions {
     pub dry_run: bool,
     pub allow_conflicts: bool,
-    pub amend: bool,
+    pub squash: bool,
 }
 
 #[derive(Default)]
@@ -214,7 +214,7 @@ async fn extract_async(
     let ExtractOptions {
         dry_run,
         allow_conflicts,
-        amend,
+        squash,
     } = options;
     let neutral = evolog
         .first()
@@ -269,15 +269,15 @@ async fn extract_async(
     let (mut ledger, mut progress) = read_ledger(repo.as_ref(), &workspace_name, evolog).await?;
     let existing = existing_extractions(repo.as_ref(), &original_base, sessions, &ledger).await?;
     // Appending uses the current parent tree, preserving earlier extracted
-    // commits byte-for-byte. Only --amend rebuilds/reorders the owned stack.
-    let base_tree = if amend {
+    // commits byte-for-byte. Only --squash rebuilds/reorders the owned stack.
+    let base_tree = if squash {
         original_base.tree()
     } else {
         live.parent_tree(repo.as_ref())
             .await
             .map_err(|e| format!("could not read the current parent tree: {e}"))?
     };
-    let base_parents = if amend {
+    let base_parents = if squash {
         vec![original_base.id().clone()]
     } else {
         live.parent_ids().to_vec()
@@ -287,7 +287,7 @@ async fn extract_async(
     let unconsumed = BTreeSet::new();
     for session in sessions {
         let selected = targets.contains(session);
-        if !amend && !selected {
+        if !squash && !selected {
             continue;
         }
         let mut priors = existing.get(session).cloned().unwrap_or_default();
@@ -297,7 +297,7 @@ async fn extract_async(
                 .iter()
                 .position(|id| *id == commit.change_id().hex())
         });
-        if amend
+        if squash
             && priors
                 .windows(2)
                 .any(|pair| pair[0].change_id() == pair[1].change_id())
@@ -312,13 +312,13 @@ async fn extract_async(
                 .known_changes
                 .contains_key(&commit.change_id().hex())
         });
-        if selected && legacy && !amend {
+        if selected && legacy && !squash {
             return Err(format!(
                 "session {session} has an older extraction without an edit checkpoint. \
-                 Run --amend once to establish its checkpoint before creating incremental extractions"
+                 Run --squash once to establish its checkpoint before creating incremental extractions"
             ));
         }
-        let consumed = if legacy && amend {
+        let consumed = if legacy && squash {
             &unconsumed
         } else {
             &progress.consumed
@@ -337,7 +337,7 @@ async fn extract_async(
         } else {
             Vec::new()
         };
-        if !amend {
+        if !squash {
             if !pending.is_empty() {
                 plans.push(SessionPlan {
                     session: session.clone(),
@@ -743,7 +743,7 @@ async fn recorded_edits(
     for index in (1..evolog.len()).rev() {
         let evolution = &evolog[index];
         if evolution.user == session && consumed.contains(&evolution.commit) {
-            // The parent (or amended prior chunk) already carries this edit's
+            // The parent (or updated prior chunk) already carries this edit's
             // context. Do not replay older formatting on those paths over it.
             // Other paths may still need formatting from before this snapshot.
             let before = load_commit(store, &evolog[index - 1].commit)?;
