@@ -44,8 +44,12 @@ printed placement; do not assume first-edit order or create a separate branch.
   independent shell, formatter, or human edits remain in live `@`. An
   overlapping neutral rewrite may move with a later attributed edit on the same
   path when separating them would create a conflict.
-- If `jj extract` reports conflicts, inspect the printed change with `jj show`
-  and report the conflict instead of hiding it.
+- Extraction refuses to publish conflicts by default. Use `--dry-run` to inspect
+  the proposed stack; pass `--allow-conflicts` only when intentionally accepting
+  conflicts. If accepted, inspect the printed changes with `jj show` and report
+  the conflicts instead of hiding them.
+- The tool verifies that the live tree is unchanged. A verification failure must
+  be investigated; `--allow-conflicts` does not bypass this check.
 - Formatting can be dropped or adopted to avoid conflicts. The tool uses
   word-level merging and optional neutral context, but preserves real conflicts
   between attributed edits. Cyclic dependencies may still require resolution.

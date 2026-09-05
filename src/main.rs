@@ -8,7 +8,7 @@
 //! composes the acting session's tagged evolutions into it.
 //!
 //! Usage:
-//!   jj extract [-m MSG]           pull my edits into their own change
+//!   jj extract                    pull my edits into their own change
 //!   jj extract --all              build a change for every session in the evolog
 //!   jj extract --dry-run          report what that would build, changing nothing
 //!   jj-extract --install/--uninstall/--hook   agent integration plumbing
@@ -67,6 +67,9 @@ struct Cli {
     /// Report what extraction would build, without changing the repository.
     #[arg(long)]
     dry_run: bool,
+    /// Permit extraction to publish conflicts (refused by default).
+    #[arg(long, conflicts_with_all = ["install", "uninstall", "hook", "project"])]
+    allow_conflicts: bool,
 }
 
 fn main() {
@@ -78,7 +81,7 @@ fn main() {
     } else if cli.uninstall {
         cmd_uninstall(cli.project)
     } else {
-        cmd_extract(cli.agent, cli.all, cli.dry_run)
+        cmd_extract(cli.agent, cli.all, cli.dry_run, cli.allow_conflicts)
     };
     exit(code);
 }
@@ -86,7 +89,7 @@ fn main() {
 // --------------------------------------------------------------------------- //
 // extract — the one command agents use
 // --------------------------------------------------------------------------- //
-fn cmd_extract(agent_opt: Option<String>, all: bool, dry_run: bool) -> i32 {
+fn cmd_extract(agent_opt: Option<String>, all: bool, dry_run: bool, allow_conflicts: bool) -> i32 {
     let root = match repo_root() {
         Some(r) => r,
         None => {
@@ -122,22 +125,26 @@ fn cmd_extract(agent_opt: Option<String>, all: bool, dry_run: bool) -> i32 {
         vec![agent]
     };
 
-    let built = match construct::extract(&root, &jj, &evolog, &targets, dry_run) {
-        Ok(built) => built,
+    let options = construct::ExtractOptions {
+        dry_run,
+        allow_conflicts,
+    };
+    let extraction = match construct::extract(&root, &jj, &evolog, &targets, options) {
+        Ok(extraction) => extraction,
         Err(e) => {
             err(&format!("Extraction stopped: {e}"));
             return 1;
         }
     };
 
-    if built.is_empty() {
+    if extraction.changes.is_empty() {
         println!("Nothing to extract for the requested session(s).");
         return 0;
     }
     if dry_run {
         println!("{}", dim("Dry run — the repository was not changed."));
     }
-    for b in &built {
+    for b in &extraction.changes {
         if dry_run {
             report_preview(b);
         } else {
@@ -147,6 +154,17 @@ fn cmd_extract(agent_opt: Option<String>, all: bool, dry_run: bool) -> i32 {
             Some(session) => println!("    after session {session}"),
             None => println!("    after extraction base"),
         }
+    }
+    for change in &extraction.descendant_conflicts {
+        let verb = if dry_run { "would have" } else { "has" };
+        println!("⚠ descendant change {change} {verb} new CONFLICTS");
+    }
+    if dry_run
+        && !allow_conflicts
+        && (extraction.changes.iter().any(|b| b.conflict)
+            || !extraction.descendant_conflicts.is_empty())
+    {
+        println!("Extraction would be refused; pass --allow-conflicts to publish these conflicts.");
     }
     0
 }

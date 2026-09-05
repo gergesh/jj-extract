@@ -88,6 +88,7 @@ Useful variants:
 jj extract --agent <session-id>  # extract an explicitly named session
 jj extract --all                 # extract every recorded session
 jj extract --dry-run             # report what that would build, changing nothing
+jj extract --allow-conflicts     # explicitly permit publishing conflicts
 ```
 
 `--agent` is useful outside the originating agent process. In normal use,
@@ -98,11 +99,14 @@ identity comes from `JJ_EXTRACT_AGENT`, `CLAUDE_CODE_SESSION_ID`, or
 session's edits would land in, whether that change already exists, which files
 it would contain, and whether stacking them would conflict. The preview is
 trustworthy because it is the real thing up to the last step — the same deltas
-composed through the same merges — stopping before the transaction is
-committed. No operation is published, no change is written, and `@` is left
-exactly as it was. A change that does not exist yet is reported as `a new
-change` rather than by ID, because a change ID is minted when its commit is
-written. It combines with `--agent` and `--all`.
+composed through the same merges, descendant rebases, and tree verification —
+stopping before the transaction is committed. No operation or visible change is
+published, and `@` is left exactly as it was. Speculative trees and commits can
+be written to the object store, but remain unreferenced. A change that does not
+exist yet is reported as `a new change` rather than by a temporary preview ID.
+It combines with `--agent` and `--all`. A conflicting preview is allowed without
+`--allow-conflicts`, since it publishes nothing; it explains that the real
+extraction requires the flag.
 
 ```console
 $ jj extract --dry-run
@@ -119,6 +123,14 @@ replaying the edits and testing for conflicts. The live change is rebased on top
 its exact pre-extraction tree is preserved. Each stack entry's diff contains
 that session's edits, while independent edits that were not attributed remain
 in `@`.
+
+Extraction verifies this invariant instead of relying only on assigning the old
+tree to the rewritten commit. It holds jj's native working-copy lock and checks
+the content-addressed live tree (including conflict labels) before extraction,
+after preparing all rewrites and descendant rebases, and after publication.
+Checkout must report zero added, removed, updated, or skipped files. A mismatch
+fails the command; one detected before publication aborts the transaction.
+`--allow-conflicts` never bypasses tree verification.
 
 Extraction is committed through `jj-lib` as one repository transaction, even
 when several session changes are built or updated. One `jj undo` therefore
@@ -196,8 +208,12 @@ Y replaces it, and X replaces Y's value again, the history needs **X → Y → X
 neither two-change order necessarily works. A dependency on an unextracted
 session can also remain unresolved: `--agent` reorders existing extractions but
 does not silently extract new sessions. `--all` makes all recorded sessions
-available for placement. Remaining conflicts are reported explicitly for normal
-jj resolution, and live `@` retains its exact clean tree if it was clean before.
+available for placement. By default, any conflicting stack is refused before
+publication. Newly conflicted descendant changes also cause the transaction to
+be refused, even if the extracted stack itself is clean. The repository is left
+unchanged on these refusals. Pass `--allow-conflicts` to publish those conflicts
+for normal jj resolution; they are reported explicitly, and live `@` retains
+its exact pre-extraction tree.
 
 ## How recording works
 
@@ -324,6 +340,8 @@ the real binary and currently covers:
 - word-level composition and partial replay of optional formatter context;
 - neutral context across intervening sessions and independent per-file cleanup;
 - deterministic planning and explicit reporting of unavoidable dependency cycles;
+- conflict refusal without publication, explicit opt-in, and descendant checks;
+- live-tree verification, unchanged file bytes/modes/symlinks, and stale-workspace rejection;
 - automatic linearization of legacy sibling extraction heads;
 - single-operation extraction and re-extraction with one-step `jj undo`;
 - operation with no `jj` executable available to the jj-extract process;

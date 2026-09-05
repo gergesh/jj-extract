@@ -83,6 +83,23 @@ n_heads() { jj log -r 'heads(all()) ~ root()' --no-graph -T '"X\n"' 2>/dev/null 
 is_conflict() { [ "$(jj log -r "$1" --no-graph -T 'if(conflict,"yes","no")' 2>/dev/null)" = yes ]; }
 op_id() { jj --at-op=@ --ignore-working-copy op log --no-graph -n 1 -T 'self.id() ++ "\n"'; }
 op_parent() { jj --at-op=@ --ignore-working-copy op log --no-graph -n 1 -T 'self.parents().map(|p| p.id()).join("\n") ++ "\n"'; }
+same_tree() {
+  local diff
+  diff="$(jj diff --from "$1" --to @ --summary)" || return 1
+  [ -z "$diff" ]
+}
+disk_manifest() {
+  python3 - <<'PY'
+import hashlib, os, stat
+for root, dirs, files in os.walk('.'):
+    dirs[:] = sorted(d for d in dirs if d not in ('.jj', '.git'))
+    for name in sorted(files + [d for d in dirs if os.path.islink(os.path.join(root, d))]):
+        path = os.path.join(root, name)
+        mode = os.lstat(path).st_mode
+        content = os.readlink(path) if stat.S_ISLNK(mode) else hashlib.sha256(open(path, 'rb').read()).hexdigest()
+        print(repr(path), oct(mode), repr(content))
+PY
+}
 
 echo "== A: sequential interleaved edits to the SAME file (line numbers shift) =="
 new_repo a
@@ -311,7 +328,7 @@ new_repo m2
 edit a1 f.txt $'A1\nl2\nl3\n'
 edit a2 f.txt $'A2\nl2\nl3\n'
 edit a1 f.txt $'A1-LATER\nl2\nl3\n'
-M2_RESULT="$(JJ_EXTRACT_AGENT=a1 "$BIN" 2>&1)"
+M2_RESULT="$(JJ_EXTRACT_AGENT=a1 "$BIN" --allow-conflicts 2>&1)"
 M2_ID="$(echo "$M2_RESULT" | grep 'session a1 ' | grep -oE 'change [0-9a-z]+' | head -1 | awk '{print $2}')"
 ok "cyclic session dependency produces the expected extracted conflict fixture" \
   "[ -n '$M2_ID' ] && is_conflict '$M2_ID'"
@@ -584,11 +601,106 @@ edit a1 f.txt $'A1\nl2\nl3\n'
 edit a2 f.txt $'A2\nl2\nl3\n'
 edit a1 f.txt $'A1-LATER\nl2\nl3\n'
 PREVIEW="$("$BIN" --all --dry-run 2>&1)"
-extract_all
+OP_BEFORE="$(op_id)"
+LIVE_BEFORE="$(jj log -r @ --no-graph -T commit_id)"
+cp f.txt "$WORK/cycle-before.txt"
+REFUSED="$("$BIN" --all 2>&1)"
+REFUSED_STATUS=$?
+ok "conflicting extraction requires an explicit opt-in" \
+  "[ '$REFUSED_STATUS' -ne 0 ] && echo \"\$REFUSED\" | grep -q -- --allow-conflicts"
+ok "refusing conflicts changes no operation, commit, or files" \
+  "[ \"$(op_id)\" = '$OP_BEFORE' ] && [ \"$(jj log -r @ --no-graph -T commit_id)\" = '$LIVE_BEFORE' ] && cmp -s f.txt '$WORK/cycle-before.txt' && [ \"$(n_extractions a1)\" = 0 ]"
+ok "dry run explains that publishing conflicts requires the flag" \
+  "echo \"\$PREVIEW\" | grep -q -- --allow-conflicts"
+BUILT="$("$BIN" --all --allow-conflicts 2>&1)"
 ok "a real cycle is reported by both planning and extraction" \
   "echo \"\$PREVIEW\" | grep -q CONFLICT && echo \"\$BUILT\" | grep -q CONFLICT && { is_conflict '$(cid a1)' || is_conflict '$(cid a2)'; }"
 ok "even an unavoidable cycle preserves the clean live working copy" \
   "! is_conflict @ && grep -q '^A1-LATER$' f.txt && [ \"$(n_heads)\" = 1 ]"
+
+echo "== AA: conflict protection also applies to updates and CLI plumbing =="
+new_repo aa
+edit a1 f.txt $'A1\nl2\nl3\n'
+A1_ID="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
+A1_COMMIT="$(jj log -r "$A1_ID" --no-graph -T commit_id)"
+edit a2 f.txt $'A2\nl2\nl3\n'
+edit a1 f.txt $'A1-LATER\nl2\nl3\n'
+OP_BEFORE="$(op_id)"
+REFUSED="$(JJ_EXTRACT_AGENT=a1 "$BIN" 2>&1)"
+REFUSED_STATUS=$?
+ok "a refused re-extraction leaves the previous extracted version intact" \
+  "[ '$REFUSED_STATUS' -ne 0 ] && [ \"$(op_id)\" = '$OP_BEFORE' ] && [ \"$(jj log -r "$A1_ID" --no-graph -T commit_id)\" = '$A1_COMMIT' ]"
+for MANAGEMENT in --install --uninstall --hook; do
+  "$BIN" "$MANAGEMENT" --allow-conflicts >/dev/null 2>&1
+  CLI_STATUS=$?
+  ok "$MANAGEMENT rejects an irrelevant --allow-conflicts" "[ '$CLI_STATUS' -eq 2 ]"
+done
+
+echo "== AB: clean extraction cannot silently conflict an existing descendant =="
+new_repo ab
+edit a1 f.txt $'A1\nl2\nl3\n'
+A1_ID="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
+jj describe -m shared-live >/dev/null 2>&1
+LIVE_ID="$(jj log -r @ --no-graph -T 'change_id.short()')"
+jj new "$A1_ID" >/dev/null 2>&1
+printf 'SIDE\nl2\nl3\n' >f.txt
+jj describe -m side-change >/dev/null 2>&1
+SIDE_ID="$(jj log -r @ --no-graph -T 'change_id.short()')"
+jj edit "$LIVE_ID" >/dev/null 2>&1
+edit a1 f.txt $'A1-LATER\nl2\nl3\n'
+LIVE_BEFORE="$(jj log -r @ --no-graph -T commit_id)"
+OP_BEFORE="$(op_id)"
+PREVIEW="$(JJ_EXTRACT_AGENT=a1 "$BIN" --dry-run 2>&1)"
+ok "dry run detects descendant conflicts without publishing" \
+  "echo \"\$PREVIEW\" | grep -q 'descendant change $SIDE_ID' && [ \"$(op_id)\" = '$OP_BEFORE' ]"
+REFUSED="$(JJ_EXTRACT_AGENT=a1 "$BIN" 2>&1)"
+REFUSED_STATUS=$?
+ok "new descendant conflicts require opt-in before publication" \
+  "[ '$REFUSED_STATUS' -ne 0 ] && echo \"\$REFUSED\" | grep -q descendant && [ \"$(op_id)\" = '$OP_BEFORE' ] && ! is_conflict '$SIDE_ID'"
+ALLOWED="$(JJ_EXTRACT_AGENT=a1 "$BIN" --allow-conflicts 2>&1)"
+ALLOWED_STATUS=$?
+ok "explicit opt-in permits and reports the descendant conflict" \
+  "[ '$ALLOWED_STATUS' -eq 0 ] && is_conflict '$SIDE_ID' && echo \"\$ALLOWED\" | grep -q 'descendant change $SIDE_ID' && same_tree '$LIVE_BEFORE'"
+
+echo "== AC: complete live trees and on-disk files survive extraction =="
+new_repo ac
+printf '#!/bin/sh\nprintf hello\n' >run.sh
+chmod +x run.sh
+ln -s f.txt link.txt
+printf '\000binary\377\n' >binary.dat
+jj file track run.sh link.txt binary.dat >/dev/null 2>&1
+jj describe -m mixed-base >/dev/null 2>&1
+jj new >/dev/null 2>&1
+codex_edit a1 f.txt $'AGENT\nl2\nl3\n'
+codex_add a1 created.txt $'NEW-FILE\n'
+printf 'AGENT\nl2\nl3\nNEUTRAL\n' >f.txt
+jj status >/dev/null 2>&1
+LIVE_BEFORE="$(jj log -r @ --no-graph -T commit_id)"
+jj config set --repo snapshot.auto-track 'none()' >/dev/null 2>&1
+printf 'untracked\n' >untracked.txt
+disk_manifest >"$WORK/disk-before.txt"
+BUILT="$(JJ_EXTRACT_AGENT=a1 "$BIN" 2>&1)"
+EXTRACT_STATUS=$?
+disk_manifest >"$WORK/disk-after.txt"
+ok "all tracked content, file types and modes have the identical tree" \
+  "[ '$EXTRACT_STATUS' -eq 0 ] && same_tree '$LIVE_BEFORE'"
+ok "tracked and untracked files remain byte-for-byte unchanged" \
+  "cmp -s '$WORK/disk-before.txt' '$WORK/disk-after.txt'"
+JJ_EXTRACT_AGENT=a1 "$BIN" >/dev/null 2>&1
+REEXTRACT_STATUS=$?
+ok "re-extraction verifies and preserves the same complete live tree" \
+  "[ '$REEXTRACT_STATUS' -eq 0 ] && same_tree '$LIVE_BEFORE'"
+
+echo "== AD: mismatched working-copy trees are rejected even with opt-in =="
+new_repo ad
+edit a1 f.txt $'AGENT\nl2\nl3\n'
+cp f.txt "$WORK/stale-before.txt"
+jj --ignore-working-copy edit @- >/dev/null 2>&1
+OP_BEFORE="$(op_id)"
+REFUSED="$(JJ_EXTRACT_AGENT=a1 "$BIN" --allow-conflicts 2>&1)"
+REFUSED_STATUS=$?
+ok "tree verification fails before publishing or checking out a stale workspace" \
+  "[ '$REFUSED_STATUS' -ne 0 ] && echo \"\$REFUSED\" | grep -q 'live tree verification failed' && [ \"$(op_id)\" = '$OP_BEFORE' ] && cmp -s f.txt '$WORK/stale-before.txt'"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

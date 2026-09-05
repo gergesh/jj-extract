@@ -61,7 +61,11 @@ avoid a false conflict.
   everyone's work).
 - Formatting can be dropped or adopted to avoid conflicts. The tool uses
   word-level merging and optional neutral context, but preserves real conflicts
-  between attributed edits. If a cycle or another conflict remains, inspect the
-  printed change with `jj show` and report it rather than hiding it.
+  between attributed edits. Conflicts are refused before publication unless
+  `--allow-conflicts` is explicitly passed. Use `--dry-run` to inspect the plan;
+  if intentionally accepting conflicts, inspect the printed changes with
+  `jj show` and report them rather than hiding them.
+- The tool verifies that the live tree is unchanged. Investigate a verification
+  failure; `--allow-conflicts` does not bypass that check.
 - If `jj-extract` isn't installed (no `jj extract` command), ignore this and work
   normally.

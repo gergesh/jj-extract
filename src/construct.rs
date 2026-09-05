@@ -6,8 +6,8 @@
 //! compose those deltas in memory, rewrite the extracted stack and the live
 //! working-copy commit once, then publish one operation. This keeps the operation
 //! log as the attribution ledger while making one `jj undo` reverse a complete
-//! extraction. A dry run composes every tree the same way and then stops: it
-//! publishes no operation and never touches the working copy.
+//! extraction. A dry run prepares the same transaction, including descendant
+//! rebases and tree checks, but publishes no operation or working-copy update.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -29,6 +29,7 @@ use jj_lib::operation::Operation;
 use jj_lib::repo::{ReadonlyRepo, Repo as _};
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::revset::{RevsetExpression, RevsetStreamExt as _};
+use jj_lib::rewrite::{RebaseOptions, RebasedCommit};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::workspace::Workspace;
@@ -39,7 +40,7 @@ use crate::jj::{Evolution, Jj};
 pub struct Built {
     pub session: String,
     /// The change the session's edits landed in. `None` only for a dry run that
-    /// would create one: a change id is minted when the commit is written.
+    /// would create one: a speculative preview ID is not a published change ID.
     pub change_id: Option<String>,
     pub conflict: bool,
     /// True when this updated a prior extraction of the same session.
@@ -50,6 +51,18 @@ pub struct Built {
     pub files: Vec<String>,
     /// The preceding session in the chosen stack, or the original base.
     pub after_session: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ExtractOptions {
+    pub dry_run: bool,
+    pub allow_conflicts: bool,
+}
+
+#[derive(Default)]
+pub struct Extraction {
+    pub changes: Vec<Built>,
+    pub descendant_conflicts: Vec<String>,
 }
 
 /// Operation attribute holding this tool's session -> extracted changes ledger.
@@ -127,8 +140,8 @@ pub fn extract(
     jj: &Jj,
     evolog: &[Evolution],
     targets: &[String],
-    dry_run: bool,
-) -> Result<Vec<Built>, String> {
+    options: ExtractOptions,
+) -> Result<Extraction, String> {
     let sessions = agents_in(evolog);
     let settings = jj.settings(
         evolog
@@ -143,7 +156,7 @@ pub fn extract(
         &sessions,
         settings.user_name(),
         settings.user_email(),
-        dry_run,
+        options,
     ))
 }
 
@@ -154,8 +167,12 @@ async fn extract_async(
     sessions: &[String],
     user_name: &str,
     user_email: &str,
-    dry_run: bool,
-) -> Result<Vec<Built>, String> {
+    options: ExtractOptions,
+) -> Result<Extraction, String> {
+    let ExtractOptions {
+        dry_run,
+        allow_conflicts,
+    } = options;
     let neutral = evolog
         .first()
         .map(|e| e.user.as_str())
@@ -183,6 +200,18 @@ async fn extract_async(
     let live = store
         .get_commit(&live_id)
         .map_err(|e| format!("could not load the live working-copy commit: {e}"))?;
+    let old_live_tree = live.tree();
+    // Hold jj's native working-copy lock throughout planning and publication.
+    // The hook lock is time-bounded and may expire during an expensive search.
+    let mut locked_workspace = workspace
+        .start_working_copy_mutation()
+        .await
+        .map_err(|e| format!("could not lock the live working copy: {e}"))?;
+    verify_live_tree(
+        &old_live_tree,
+        locked_workspace.locked_wc().old_tree(),
+        "before extraction",
+    )?;
 
     let oldest = load_commit(store, &evolog[0].commit)?;
     let base_id = oldest
@@ -222,17 +251,30 @@ async fn extract_async(
         }
     }
     if !plans.iter().any(|plan| targets.contains(&plan.session)) {
-        return Ok(Vec::new());
+        return Ok(Extraction::default());
     }
     let stack = plan_stack(&base.tree(), &plans).await?;
+    if !dry_run && !allow_conflicts && stack.conflicts > 0 {
+        let sessions = stack
+            .order
+            .iter()
+            .zip(&stack.trees)
+            .filter(|(_, tree)| tree.has_conflict())
+            .map(|(&index, _)| plans[index].session.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "extraction would create conflicts in session(s) {sessions}; repository unchanged. \
+             Inspect with --dry-run, or pass --allow-conflicts to proceed"
+        ));
+    }
 
-    let old_live_tree = live.tree();
     // The transaction is the unit of publication: nothing inside it reaches the
     // repository until the `tx.commit()` below, which a dry run never makes.
     let mut tx = repo.start_transaction();
     tx.set_workspace_name(&workspace_name);
-    // The stack advances by content always and by commit only when we write, so
-    // a dry run stacks the same trees onto a tip it never parents anything to.
+    // Dry runs also build unreferenced commits inside this transaction so that
+    // descendant rebasing and tree verification run exactly as in a real extract.
     let mut tip = base.clone();
     let mut tip_tree = base.tree();
     let mut built = Vec::new();
@@ -247,53 +289,48 @@ async fn extract_async(
             .map(|commit| commit.description().to_owned())
             .unwrap_or_else(|| extraction_desc(session, kind_of(evolog, session).as_deref()));
         let updated = prior.is_some();
-        let written = if dry_run {
-            None
+        let result = if let Some(prior) = &prior {
+            tx.repo_mut()
+                .rewrite_commit(prior)
+                .set_parents(vec![tip.id().clone()])
+                .set_tree(stacked_tree.clone())
+                .set_description(description)
+                .write()
+                .await
         } else {
-            let result = if let Some(prior) = &prior {
-                tx.repo_mut()
-                    .rewrite_commit(prior)
-                    .set_parents(vec![tip.id().clone()])
-                    .set_tree(stacked_tree.clone())
-                    .set_description(description)
-                    .write()
-                    .await
-            } else {
-                tx.repo_mut()
-                    .new_commit(vec![tip.id().clone()], stacked_tree.clone())
-                    .set_description(description)
-                    .write()
-                    .await
-            };
-            let commit =
-                result.map_err(|e| format!("could not write extracted session {session}: {e}"))?;
-            if prior_commits.len() > 1 {
-                for duplicate in prior_commits.drain(1..) {
-                    tx.repo_mut().record_abandoned_commit(&duplicate);
-                }
-            }
-            Some(commit)
+            tx.repo_mut()
+                .new_commit(vec![tip.id().clone()], stacked_tree.clone())
+                .set_description(description)
+                .write()
+                .await
         };
+        let commit =
+            result.map_err(|e| format!("could not write extracted session {session}: {e}"))?;
+        if prior_commits.len() > 1 {
+            for duplicate in prior_commits.drain(1..) {
+                tx.repo_mut().record_abandoned_commit(&duplicate);
+            }
+        }
 
         if targets.contains(session) {
-            if let Some(commit) = &written {
-                let extracted = ledger.entry(session.clone()).or_default();
-                let change = commit.change_id().hex();
-                if !extracted.contains(&change) {
-                    extracted.push(change);
-                }
+            let extracted = ledger.entry(session.clone()).or_default();
+            let change = commit.change_id().hex();
+            if !extracted.contains(&change) {
+                extracted.push(change);
             }
         }
         // Existing entries are rewritten too. Report the entire chosen stack,
         // including conflicts in a non-target entry that moved above a target.
         built.push(Built {
             session: session.clone(),
-            // A dry run can name the change it would update; one it would
-            // create has no id to name until the commit is written.
-            change_id: written
-                .as_ref()
-                .or(prior.as_ref())
-                .map(|commit| short_hex(commit.change_id().reverse_hex())),
+            // Name existing changes in a preview, but do not expose speculative
+            // IDs which will differ when a real extraction creates the change.
+            change_id: (if dry_run {
+                prior.as_ref()
+            } else {
+                Some(&commit)
+            })
+            .map(|commit| short_hex(commit.change_id().reverse_hex())),
             conflict: stacked_tree.has_conflict(),
             updated,
             files: if dry_run {
@@ -305,18 +342,8 @@ async fn extract_async(
                 .checked_sub(1)
                 .map(|previous| plans[stack.order[previous]].session.clone()),
         });
-        if let Some(commit) = written {
-            tip = commit;
-        }
+        tip = commit;
         tip_tree = stacked_tree.clone();
-    }
-
-    // A dry run ends here: the transaction is dropped uncommitted, so no
-    // operation is published and live `@` is never rewritten. The trees the
-    // merges produced stay in the store as unreferenced content, like every
-    // other computation jj abandons.
-    if dry_run {
-        return Ok(built);
     }
 
     let new_live = tx
@@ -332,20 +359,78 @@ async fn extract_async(
     tx.repo_mut()
         .set_wc_commit(workspace_name.clone(), new_live.id().clone())
         .map_err(|e| format!("could not preserve the live working-copy change: {e}"))?;
+    let mut rebased_descendants = Vec::new();
     tx.repo_mut()
-        .rebase_descendants()
+        .rebase_descendants_with_options(
+            &RevsetExpression::none(),
+            &RebaseOptions::default(),
+            |old, rebased| {
+                if let RebasedCommit::Rewritten(commit) = rebased {
+                    if commit.tree().has_conflict() {
+                        rebased_descendants.push((old, commit));
+                    }
+                }
+            },
+        )
         .await
         .map_err(|e| format!("could not rebase descendants of extracted changes: {e}"))?;
+    let mut descendant_conflicts = Vec::new();
+    for (old, rebased) in rebased_descendants {
+        for (path, value) in rebased.tree().conflicts() {
+            let value = value.map_err(|e| format!("could not inspect descendant conflict: {e}"))?;
+            let old_value = old
+                .tree()
+                .path_value(&path)
+                .await
+                .map_err(|e| format!("could not inspect prior descendant tree: {e}"))?;
+            if value != old_value {
+                descendant_conflicts.push(short_hex(rebased.change_id().reverse_hex()));
+                break;
+            }
+        }
+    }
+    if !dry_run && !allow_conflicts && !descendant_conflicts.is_empty() {
+        return Err(format!(
+            "extraction would create conflicts in descendant change(s) {}; repository unchanged. \
+             Pass --allow-conflicts to proceed",
+            descendant_conflicts.join(", ")
+        ));
+    }
+    // Check the actual workspace commit selected by the completed transaction,
+    // after descendant rebasing, rather than trusting set_tree() above.
+    let prepared_id = tx
+        .repo()
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .ok_or_else(|| "the extraction transaction lost the working-copy commit".to_string())?;
+    let prepared = store
+        .get_commit(prepared_id)
+        .map_err(|e| format!("could not load the prepared working-copy commit: {e}"))?;
+    verify_live_tree(
+        &old_live_tree,
+        &prepared.tree(),
+        "before publishing extraction",
+    )?;
+
+    let extraction = Extraction {
+        changes: built,
+        descendant_conflicts,
+    };
+    // All safety checks have run. Dropping a preview transaction publishes no
+    // operation and leaves speculative objects unreachable from the repository.
+    if dry_run {
+        return Ok(extraction);
+    }
 
     tx.set_attribute(
         LEDGER_ATTRIBUTE.to_string(),
         serde_json::to_string(&ledger)
             .map_err(|e| format!("could not write the extraction ledger: {e}"))?,
     );
-    let operation_description = if built.len() == 1 {
-        format!("extract session {}", built[0].session)
+    let operation_description = if extraction.changes.len() == 1 {
+        format!("extract session {}", extraction.changes[0].session)
     } else {
-        format!("extract {} sessions", built.len())
+        format!("extract {} sessions", extraction.changes.len())
     };
     let new_repo = tx
         .commit(operation_description)
@@ -359,12 +444,36 @@ async fn extract_async(
         .store()
         .get_commit(checked_out_id)
         .map_err(|e| format!("could not load the extracted working-copy commit: {e}"))?;
-    workspace
-        .check_out(new_repo.op_id().clone(), Some(&old_live_tree), &checked_out)
+    verify_live_tree(
+        &old_live_tree,
+        &checked_out.tree(),
+        "after publishing extraction",
+    )?;
+    let stats = locked_workspace
+        .locked_wc()
+        .check_out(&checked_out)
         .await
         .map_err(|e| format!("could not update the working copy after extraction: {e}"))?;
+    if stats != jj_lib::working_copy::CheckoutStats::default() {
+        return Err(format!(
+            "live tree verification failed: checkout unexpectedly changed files: {stats:?}"
+        ));
+    }
+    locked_workspace
+        .finish(new_repo.op_id().clone())
+        .await
+        .map_err(|e| format!("could not save the verified working-copy state: {e}"))?;
 
-    Ok(built)
+    Ok(extraction)
+}
+
+fn verify_live_tree(before: &MergedTree, after: &MergedTree, phase: &str) -> Result<(), String> {
+    if before.tree_ids_and_labels() != after.tree_ids_and_labels() {
+        return Err(format!(
+            "live tree verification failed {phase}: tree contents or conflict labels changed"
+        ));
+    }
+    Ok(())
 }
 
 /// The changes a previous extraction built for `sessions`, restricted to this
