@@ -12,8 +12,9 @@ $ jj describe -r yxw... -m "Improve install errors"
 ```
 
 There is no start or tracking command. Once the hooks are installed, recording
-is automatic and extraction is idempotent: running it again updates the same
-session change instead of creating duplicates.
+is automatic. Each extraction creates a new change containing only edits since
+that session’s last extraction. With no new edits, it does nothing. Use
+`--amend` to add pending edits to the latest extracted change instead.
 
 ## Requirements
 
@@ -76,17 +77,16 @@ An individual session normally runs one command when its work is ready:
 jj extract
 ```
 
-Extraction writes no description. A new change starts with a `jj-extract:
-<session>` placeholder for its author to replace with `jj describe`, having read
-the change that was actually built; re-extraction then leaves that description
-alone. Descriptions written blind, before the change exists, are the ones worth
-nobody's time.
+A new change starts with a `jj-extract: <session>` placeholder for its author to
+replace with `jj describe`, having read the change that was actually built. This placeholder is not used to find the
+change: descriptions can be replaced entirely, and `--amend` preserves them.
 
 Useful variants:
 
 ```bash
 jj extract --agent <session-id>  # extract an explicitly named session
-jj extract --all                 # extract every recorded session
+jj extract --all                 # create a new change for each session with pending edits
+jj extract --amend               # add pending edits to my latest extraction
 jj extract --dry-run             # report what that would build, changing nothing
 jj extract --allow-conflicts     # explicitly permit publishing conflicts
 ```
@@ -118,8 +118,9 @@ Dry run — the repository was not changed.
 
 After extraction, the shared live working-copy change remains checked out and its
 files are unchanged. Extracted changes are inserted as a linear stack
-between the original base and live `@`; extraction chooses their order by
-replaying the edits and testing for conflicts. The live change is rebased on top while
+between the current parents and live `@`; extraction chooses the order of the
+new changes by replaying the edits and testing for conflicts. Earlier extracted
+commits remain untouched. The live change is rebased on top while
 its exact pre-extraction tree is preserved. Each stack entry's diff contains
 that session's edits, while independent edits that were not attributed remain
 in `@`.
@@ -134,9 +135,9 @@ fails the command; one detected before publication aborts the transaction.
 
 Extraction is committed through `jj-lib` as one repository transaction, even
 when several session changes are built or updated. One `jj undo` therefore
-reverses one complete extraction; undoing a re-extraction restores the prior
-version of the same extracted change. Because the library API is versioned with
-jj, jj-extract currently embeds `jj-lib` 0.44.0 and supports jj 0.44.x.
+reverses one complete extraction and restores its pending edits. Undoing
+`--amend` restores the prior version of the amended change. Because the library
+API is versioned with jj, jj-extract currently embeds `jj-lib` 0.44.0 and supports jj 0.44.x.
 Recording, evolution traversal, commit lookup, and extraction all use `jj-lib`
 directly; jj-extract never spawns the `jj` CLI. Installation writes its owned
 `conf.d/zz-jj-extract.toml` alias fragment with jj-lib's config API.
@@ -147,32 +148,51 @@ false conflicts for causally dependent edits. Inspect an entry with the
 `jj show <change-id>` command printed in the result.
 
 If an older jj-extract release already left session changes as sibling heads,
-the next extraction linearizes those owned changes while preserving their change
-IDs.
+`--amend` linearizes those owned changes while preserving their change IDs.
 
 An extracted change is credited with the standard `Co-authored-by:` trailer the
 session's own agent writes — `Claude <noreply@anthropic.com>` for Claude Code,
 `Codex <noreply@openai.com>` for Codex — and nothing else. Which session a
 change was built for is recorded in the extraction operation's own metadata, not
 in the description, so `jj describe` is free to replace the text entirely: the
-next extraction still updates the same change. That ledger is written to the
-operation log, so it survives every rewrite of the change but not a discarded
-operation history; an extraction whose ledger entry is gone builds a new change
-rather than updating the old one.
+next `--amend` can still locate the latest extraction. The operation log also
+records which edit snapshots have already been extracted. Previewing or refusing
+an extraction does not consume edits; undo restores the previous checkpoint.
+Renaming or manually squashing extracted changes does not replay their old edits.
 
-Re-extraction updates an existing session change only on the same stable
-extraction base. The same session extracted from another branch line receives a
-distinct change ID instead of rewriting the earlier line.
+### Repeated extraction and amendment
 
-Both extraction and dry run print the chosen order, including existing session
-changes that are moved or rewritten. Change IDs and descriptions survive a move.
+The default is additive. If X extracts, Y builds on X and extracts, and X edits
+again, the result is **X₁ → Y₁ → X₂ → live @**. X₂ contains only X’s new edits;
+X₁ and Y₁ keep their exact commits and descriptions. You can combine chunks later
+with `jj squash` when that is useful.
+
+`jj extract --amend` explicitly adds pending edits to the latest visible
+extraction for the session on this extraction base. It preserves earlier chunks
+as separate changes, but may move or rebase existing extracted changes to find a
+clean order. Their change IDs and descriptions survive; their commit hashes can
+change. With no prior extraction, it creates the first change. `--all --amend`
+amends each session’s latest extraction. Amendment can also relinearize the stack
+without new edits, so preview it when placement matters.
+
+Older releases did not record edit checkpoints. When a visible extraction lacks
+one, the default refuses to guess which historical edits are new. Run `--amend`
+once for that session to establish its checkpoint, then use incremental
+extraction normally. This migration may reconstruct the older extraction from
+its recorded history; review it with `--amend --dry-run` first.
+
+Both extraction and dry run print the chosen order. Existing changes are only
+moved or rewritten with `--amend`. Metadata follows the surviving evolution of
+the live working-copy change; discarded operation history cannot supply a lost
+checkpoint.
 
 ### Conflict reduction
 
 First-edit time is a preference, not a fixed position. For example, X can create
 an unrelated file, Y can introduce a function, and X can then modify that
 function. X started first, but the clean stack is **Y → X → live @**.
-Re-extracting X can move its existing change above Y without creating a new ID.
+Amending X can move its latest existing change above Y without creating a new ID.
+Default extraction instead appends a new X chunk above the existing stack.
 
 The planner first tries chronological order. If any entry conflicts, it searches
 alternative orders, replaying each session directly onto its candidate parent.
@@ -185,6 +205,13 @@ permutation search for large stacks. Dry runs use precisely the same planner.
 Formatting is expendable when it would introduce a conflict:
 
 - Word-level merges separate independent edits to different parts of one line.
+- Rust formatter-only edits are optional even when attributed to another agent.
+  When `rustfmt` is available, both file versions must produce identical output
+  before an edit is classified as formatting. It runs on stdin/stdout with an
+  empty configuration and child modules disabled; working files are untouched.
+  Missing rustfmt, invalid Rust, binary data, files over 1 MiB, and metadata
+  changes keep ordinary merge behavior. Other languages use the word-level and
+  neutral-context strategies; arbitrary whitespace is never blindly stripped.
 - Neutral formatter context is found across intervening edits by other sessions,
   and carried only on paths the session subsequently touches.
 - A conflicting neutral rewrite is replayed partially for ordinary text files:
@@ -327,10 +354,12 @@ the five-agent formatting stress test.
 
 The stress test uses five concurrent hook clients editing shared Rust files,
 with real `rustfmt` sweeps at varying widths between randomly sized batches of
-edits. All sessions remain active across formatting and mid-task extraction.
-It also introduces a five-session dependency chain that requires moving existing
-changes, then re-extracts each session individually. It verifies semantic
-ownership, stable IDs, unchanged live trees and file bytes, operation atomicity,
+edits. Sweeps alternate between neutral and agent-attributed formatting. All
+sessions remain active across formatting and mid-task extraction.
+It runs both default incremental extraction and `--amend`, including a
+five-session dependency chain and subsequent individual extractions. It verifies
+semantic ownership, untouched earlier commits by default, stable amended IDs,
+unchanged live trees and file bytes, operation atomicity,
 and the absence of conflicts without `--allow-conflicts`. Formatting is scheduled
 between file-tool windows; simultaneous unsynchronized writes to the same bytes
 are not modeled. Seeds 7, 42, and 99 run by default; a failure prints the actual
@@ -350,7 +379,8 @@ the real binary and currently covers:
 - exclusion of non-tool changes;
 - single-session and all-session extraction;
 - composition of multiple edits and new files;
-- stable, duplicate-free re-extraction;
+- incremental chunks, no-op repeats, independent checkpoints, and latest-chunk amendment;
+- checkpoint recovery after undo and manual squash;
 - a single linear head with no divergent change IDs;
 - conflict-free stacking of causally dependent session edits;
 - automatic reordering of late dependencies, including create/delete edits;
@@ -360,7 +390,7 @@ the real binary and currently covers:
 - deterministic planning and explicit reporting of unavoidable dependency cycles;
 - conflict refusal without publication, explicit opt-in, and descendant checks;
 - live-tree verification, unchanged file bytes/modes/symlinks, and stale-workspace rejection;
-- automatic linearization of legacy sibling extraction heads;
+- opt-in linearization of sibling extraction heads;
 - single-operation extraction and re-extraction with one-step `jj undo`;
 - operation with no `jj` executable available to the jj-extract process;
 - isolated dual-client install/uninstall and settings preservation;

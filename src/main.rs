@@ -9,11 +9,13 @@
 //!
 //! Usage:
 //!   jj extract                    pull my edits into their own change
-//!   jj extract --all              build a change for every session in the evolog
+//!   jj extract --all              build new changes for sessions with pending edits
+//!   jj extract --amend            add pending edits to my latest extracted change
 //!   jj extract --dry-run          report what that would build, changing nothing
 //!   jj-extract --install/--uninstall/--hook   agent integration plumbing
 
 mod construct;
+mod formatting;
 mod hook;
 mod identity;
 mod install;
@@ -58,7 +60,7 @@ struct Cli {
     /// With --install/--uninstall: target this repo's hook configs, not global ones.
     #[arg(long, requires = "management")]
     project: bool,
-    /// Extract a change for every session found in the evolog, not just this one.
+    /// Extract pending edits for every recorded session, not just this one.
     #[arg(long, conflicts_with = "agent")]
     all: bool,
     /// Session to extract (default: the current agent's exported session identity).
@@ -70,6 +72,9 @@ struct Cli {
     /// Permit extraction to publish conflicts (refused by default).
     #[arg(long, conflicts_with_all = ["install", "uninstall", "hook", "project"])]
     allow_conflicts: bool,
+    /// Add pending edits to this session's latest extracted change instead of creating a new one.
+    #[arg(long, conflicts_with_all = ["install", "uninstall", "hook", "project"])]
+    amend: bool,
 }
 
 fn main() {
@@ -81,7 +86,15 @@ fn main() {
     } else if cli.uninstall {
         cmd_uninstall(cli.project)
     } else {
-        cmd_extract(cli.agent, cli.all, cli.dry_run, cli.allow_conflicts)
+        cmd_extract(
+            cli.agent,
+            cli.all,
+            construct::ExtractOptions {
+                dry_run: cli.dry_run,
+                allow_conflicts: cli.allow_conflicts,
+                amend: cli.amend,
+            },
+        )
     };
     exit(code);
 }
@@ -89,7 +102,12 @@ fn main() {
 // --------------------------------------------------------------------------- //
 // extract — the one command agents use
 // --------------------------------------------------------------------------- //
-fn cmd_extract(agent_opt: Option<String>, all: bool, dry_run: bool, allow_conflicts: bool) -> i32 {
+fn cmd_extract(agent_opt: Option<String>, all: bool, options: construct::ExtractOptions) -> i32 {
+    let construct::ExtractOptions {
+        dry_run,
+        allow_conflicts,
+        ..
+    } = options;
     let root = match repo_root() {
         Some(r) => r,
         None => {
@@ -125,10 +143,6 @@ fn cmd_extract(agent_opt: Option<String>, all: bool, dry_run: bool, allow_confli
         vec![agent]
     };
 
-    let options = construct::ExtractOptions {
-        dry_run,
-        allow_conflicts,
-    };
     let extraction = match construct::extract(&root, &jj, &evolog, &targets, options) {
         Ok(extraction) => extraction,
         Err(e) => {
@@ -138,7 +152,7 @@ fn cmd_extract(agent_opt: Option<String>, all: bool, dry_run: bool, allow_confli
     };
 
     if extraction.changes.is_empty() {
-        println!("Nothing to extract for the requested session(s).");
+        println!("Nothing new to extract for the requested session(s).");
         return 0;
     }
     if dry_run {

@@ -1,5 +1,5 @@
-//! Best-effort replay of optional, unattributed context. Conflicting hunks of a
-//! neutral rewrite can be omitted; attributed edits must always use a full merge.
+//! Best-effort replay of optional context, including recognized formatter-only
+//! edits. Conflicting context can be omitted; substantive edits use a full merge.
 
 use futures::AsyncReadExt as _;
 use jj_lib::backend::TreeValue;

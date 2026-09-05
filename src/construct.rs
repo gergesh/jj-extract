@@ -1,7 +1,7 @@
 //! Extract recorded agent edits in one jj transaction.
 //!
-//! Every attributed evolution contributes the tree delta from its predecessor
-//! to itself. Neutral snapshots preceding an edit are carried on the paths that
+//! Pending attributed evolutions contribute their predecessor-to-snapshot deltas.
+//! Formatter-only edits and neutral snapshots are carried on the paths that
 //! edit touched, then removed again when their inverse commutes cleanly. We
 //! compose those deltas in memory, rewrite the extracted stack and the live
 //! working-copy commit once, then publish one operation. This keeps the operation
@@ -33,6 +33,7 @@ use jj_lib::rewrite::{RebaseOptions, RebasedCommit};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::workspace::Workspace;
+use serde::{Deserialize, Serialize};
 
 use crate::identity;
 use crate::jj::{Evolution, Jj};
@@ -57,6 +58,7 @@ pub struct Built {
 pub struct ExtractOptions {
     pub dry_run: bool,
     pub allow_conflicts: bool,
+    pub amend: bool,
 }
 
 #[derive(Default)]
@@ -74,10 +76,24 @@ pub struct Extraction {
 /// already this tool's ledger, and it survives the rewrites that extraction and
 /// re-description perform on the change itself.
 const LEDGER_ATTRIBUTE: &str = "jj-extract.extractions";
+const PROGRESS_ATTRIBUTE: &str = "jj-extract.progress";
+
+/// Snapshot IDs, not timestamps or descriptions, identify consumed edits. The
+/// operation log owns the checkpoint, so undo restores the pending edits too.
+#[derive(Default, Serialize, Deserialize)]
+struct Progress {
+    consumed: BTreeSet<String>,
+    known_changes: BTreeMap<String, Checkpoint>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Checkpoint {
+    snapshots: BTreeSet<String>,
+    commit: String,
+}
 
 /// Session -> the changes extracted for it, newest last. A session can hold
-/// more than one: extracting the same session from a different branch line
-/// builds a change of its own there.
+/// more than one: each incremental extraction adds a new chunk.
 type Ledger = BTreeMap<String, Vec<String>>;
 
 /// The description a *newly* built change starts with: a placeholder naming the
@@ -103,10 +119,13 @@ fn kind_of(evolog: &[Evolution], session: &str) -> Option<String> {
 }
 
 /// The newest ledger this tool published, found by walking back through its own
-/// operations. Absent (or unreadable, which can only mean a version wrote a
-/// shape this one doesn't know) it starts empty: extraction then builds a fresh
-/// change instead of updating one, which is the same outcome as a first run.
-async fn read_ledger(repo: &ReadonlyRepo) -> Result<Ledger, String> {
+/// operations. Missing metadata starts empty; unreadable metadata must fail
+/// rather than risk replaying already extracted edits.
+async fn read_ledger(
+    repo: &ReadonlyRepo,
+    workspace: &jj_lib::ref_name::WorkspaceName,
+    evolog: &[Evolution],
+) -> Result<(Ledger, Progress), String> {
     use futures::TryStreamExt as _;
 
     let head: Operation = repo.operation().clone();
@@ -117,10 +136,33 @@ async fn read_ledger(repo: &ReadonlyRepo) -> Result<Ledger, String> {
         .map_err(|e| format!("could not read the operation log: {e}"))?
     {
         if let Some(raw) = operation.metadata().attributes.get(LEDGER_ATTRIBUTE) {
-            return Ok(serde_json::from_str(raw).unwrap_or_default());
+            // `jj undo` restores a view, but the undone operation remains in
+            // the operation ancestry. Only checkpoints on this live change's
+            // surviving evolution history have actually consumed its edits.
+            let view = operation
+                .view()
+                .await
+                .map_err(|e| format!("could not read extraction checkpoint view: {e}"))?;
+            if !view
+                .get_wc_commit_id(workspace)
+                .is_some_and(|id| evolog.iter().any(|evolution| evolution.commit == id.hex()))
+            {
+                continue;
+            }
+            let ledger = serde_json::from_str(raw)
+                .map_err(|e| format!("could not read the extraction ledger: {e}"))?;
+            let progress = operation
+                .metadata()
+                .attributes
+                .get(PROGRESS_ATTRIBUTE)
+                .map(|raw| serde_json::from_str(raw))
+                .transpose()
+                .map_err(|e| format!("could not read extraction progress: {e}"))?
+                .unwrap_or_default();
+            return Ok((ledger, progress));
         }
     }
-    Ok(Ledger::new())
+    Ok((Ledger::new(), Progress::default()))
 }
 
 /// Agents present in the evolog, in first-edit order.
@@ -172,6 +214,7 @@ async fn extract_async(
     let ExtractOptions {
         dry_run,
         allow_conflicts,
+        amend,
     } = options;
     let neutral = evolog
         .first()
@@ -219,41 +262,162 @@ async fn extract_async(
         .first()
         .cloned()
         .ok_or_else(|| "the oldest recorded evolution has no parent".to_string())?;
-    let base = store
+    let original_base = store
         .get_commit(&base_id)
         .map_err(|e| format!("could not load the extraction base: {e}"))?;
 
-    let mut ledger = read_ledger(repo.as_ref()).await?;
-    let mut existing = existing_extractions(repo.as_ref(), &base, sessions, &ledger).await?;
+    let (mut ledger, mut progress) = read_ledger(repo.as_ref(), &workspace_name, evolog).await?;
+    let existing = existing_extractions(repo.as_ref(), &original_base, sessions, &ledger).await?;
+    // Appending uses the current parent tree, preserving earlier extracted
+    // commits byte-for-byte. Only --amend rebuilds/reorders the owned stack.
+    let base_tree = if amend {
+        original_base.tree()
+    } else {
+        live.parent_tree(repo.as_ref())
+            .await
+            .map_err(|e| format!("could not read the current parent tree: {e}"))?
+    };
+    let base_parents = if amend {
+        vec![original_base.id().clone()]
+    } else {
+        live.parent_ids().to_vec()
+    };
 
     let mut plans = Vec::new();
+    let unconsumed = BTreeSet::new();
     for session in sessions {
-        let prior = existing.get(session).and_then(|commits| commits.first());
-        let edits = if targets.contains(session) {
-            recorded_edits(store, &base.tree(), session, evolog).await?
-        } else if let Some(prior) = prior {
-            vec![ReplayEdit {
-                before: prior
-                    .parent_tree(repo.as_ref())
-                    .await
-                    .map_err(|e| format!("could not read {session}'s prior parent tree: {e}"))?,
-                after: prior.tree(),
-                neutral: false,
-            }]
+        let selected = targets.contains(session);
+        if !amend && !selected {
+            continue;
+        }
+        let mut priors = existing.get(session).cloned().unwrap_or_default();
+        let changes = ledger.get(session).cloned().unwrap_or_default();
+        priors.sort_by_key(|commit| {
+            changes
+                .iter()
+                .position(|id| *id == commit.change_id().hex())
+        });
+        if amend
+            && priors
+                .windows(2)
+                .any(|pair| pair[0].change_id() == pair[1].change_id())
+        {
+            return Err(format!(
+                "session {session} has divergent extracted changes; resolve the divergence first"
+            ));
+        }
+        let latest = priors.last();
+        let legacy = latest.is_some_and(|commit| {
+            !progress
+                .known_changes
+                .contains_key(&commit.change_id().hex())
+        });
+        if selected && legacy && !amend {
+            return Err(format!(
+                "session {session} has an older extraction without an edit checkpoint. \
+                 Run --amend once to establish its checkpoint before creating incremental extractions"
+            ));
+        }
+        let consumed = if legacy && amend {
+            &unconsumed
+        } else {
+            &progress.consumed
+        };
+        let snapshots = if selected {
+            evolog
+                .iter()
+                .filter(|e| e.user == *session && !consumed.contains(&e.commit))
+                .map(|e| e.commit.clone())
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-        if !edits.is_empty() {
+        let pending = if selected {
+            recorded_edits(store, &base_tree, session, evolog, consumed).await?
+        } else {
+            Vec::new()
+        };
+        if !amend {
+            if !pending.is_empty() {
+                plans.push(SessionPlan {
+                    session: session.clone(),
+                    edits: pending,
+                    fallback: None,
+                    prior: None,
+                    snapshots,
+                    selected: true,
+                });
+            }
+            continue;
+        }
+        let latest_id = latest.map(|commit| commit.id().clone());
+        let mut pending = pending;
+        for prior in priors {
+            let update = selected && Some(prior.id()) == latest_id.as_ref();
+            let mut fallback = None;
+            if update {
+                if let Some(checkpoint) = progress.known_changes.get(&prior.change_id().hex()) {
+                    let recorded = load_commit(store, &checkpoint.commit)?;
+                    // A squashed delta can lose useful formatter context.
+                    // Replaying this chunk's original edits is another exact
+                    // representation, provided no manual content was added.
+                    if recorded.parent_ids() == prior.parent_ids()
+                        && recorded.tree().tree_ids_and_labels()
+                            == prior.tree().tree_ids_and_labels()
+                    {
+                        let earlier_chunks = consumed
+                            .difference(&checkpoint.snapshots)
+                            .cloned()
+                            .collect();
+                        fallback = Some(
+                            recorded_edits(store, &base_tree, session, evolog, &earlier_chunks)
+                                .await?,
+                        );
+                    }
+                }
+            }
+            let mut edits = if update && legacy {
+                Vec::new()
+            } else {
+                vec![ReplayEdit {
+                    before: prior.parent_tree(repo.as_ref()).await.map_err(|e| {
+                        format!("could not read {session}'s prior parent tree: {e}")
+                    })?,
+                    after: prior.tree(),
+                    neutral: false,
+                }]
+            };
+            if update {
+                edits.append(&mut pending);
+            }
             plans.push(SessionPlan {
                 session: session.clone(),
                 edits,
+                fallback,
+                prior: Some(prior),
+                snapshots: if update {
+                    snapshots.clone()
+                } else {
+                    Vec::new()
+                },
+                selected: update,
+            });
+        }
+        if latest_id.is_none() && !pending.is_empty() {
+            plans.push(SessionPlan {
+                session: session.clone(),
+                edits: pending,
+                fallback: None,
+                prior: None,
+                snapshots,
+                selected,
             });
         }
     }
-    if !plans.iter().any(|plan| targets.contains(&plan.session)) {
+    if !plans.iter().any(|plan| plan.selected) {
         return Ok(Extraction::default());
     }
-    let stack = plan_stack(&base.tree(), &plans).await?;
+    let stack = plan_stack(&base_tree, &plans).await?;
     if !dry_run && !allow_conflicts && stack.conflicts > 0 {
         let sessions = stack
             .order
@@ -275,49 +439,62 @@ async fn extract_async(
     tx.set_workspace_name(&workspace_name);
     // Dry runs also build unreferenced commits inside this transaction so that
     // descendant rebasing and tree verification run exactly as in a real extract.
-    let mut tip = base.clone();
-    let mut tip_tree = base.tree();
+    let mut tip_parents = base_parents;
+    let mut tip_tree = base_tree;
     let mut built = Vec::new();
 
     for (position, (&index, stacked_tree)) in stack.order.iter().zip(&stack.trees).enumerate() {
-        let session = &plans[index].session;
-        let mut prior_commits = existing.remove(session).unwrap_or_default();
-        let prior = prior_commits.first().cloned();
+        let plan = &plans[index];
+        let session = &plan.session;
+        let prior = &plan.prior;
         // Reordering and re-extraction preserve the author's description.
         let description = prior
             .as_ref()
             .map(|commit| commit.description().to_owned())
             .unwrap_or_else(|| extraction_desc(session, kind_of(evolog, session).as_deref()));
         let updated = prior.is_some();
-        let result = if let Some(prior) = &prior {
-            tx.repo_mut()
-                .rewrite_commit(prior)
-                .set_parents(vec![tip.id().clone()])
-                .set_tree(stacked_tree.clone())
-                .set_description(description)
-                .write()
-                .await
-        } else {
-            tx.repo_mut()
-                .new_commit(vec![tip.id().clone()], stacked_tree.clone())
-                .set_description(description)
-                .write()
-                .await
+        let result = match prior {
+            Some(prior)
+                if prior.parent_ids() == tip_parents
+                    && prior.tree().tree_ids_and_labels() == stacked_tree.tree_ids_and_labels() =>
+            {
+                Ok(prior.clone())
+            }
+            Some(prior) => {
+                tx.repo_mut()
+                    .rewrite_commit(prior)
+                    .set_parents(tip_parents.clone())
+                    .set_tree(stacked_tree.clone())
+                    .set_description(description)
+                    .write()
+                    .await
+            }
+            None => {
+                tx.repo_mut()
+                    .new_commit(tip_parents.clone(), stacked_tree.clone())
+                    .set_description(description)
+                    .write()
+                    .await
+            }
         };
         let commit =
             result.map_err(|e| format!("could not write extracted session {session}: {e}"))?;
-        if prior_commits.len() > 1 {
-            for duplicate in prior_commits.drain(1..) {
-                tx.repo_mut().record_abandoned_commit(&duplicate);
-            }
-        }
-
-        if targets.contains(session) {
+        if plan.selected {
             let extracted = ledger.entry(session.clone()).or_default();
             let change = commit.change_id().hex();
             if !extracted.contains(&change) {
-                extracted.push(change);
+                extracted.push(change.clone());
             }
+            let checkpoint = progress
+                .known_changes
+                .entry(change)
+                .or_insert_with(|| Checkpoint {
+                    snapshots: BTreeSet::new(),
+                    commit: String::new(),
+                });
+            checkpoint.snapshots.extend(plan.snapshots.iter().cloned());
+            checkpoint.commit = commit.id().hex();
+            progress.consumed.extend(plan.snapshots.iter().cloned());
         }
         // Existing entries are rewritten too. Report the entire chosen stack,
         // including conflicts in a non-target entry that moved above a target.
@@ -342,14 +519,14 @@ async fn extract_async(
                 .checked_sub(1)
                 .map(|previous| plans[stack.order[previous]].session.clone()),
         });
-        tip = commit;
+        tip_parents = vec![commit.id().clone()];
         tip_tree = stacked_tree.clone();
     }
 
     let new_live = tx
         .repo_mut()
         .rewrite_commit(&live)
-        .set_parents(vec![tip.id().clone()])
+        .set_parents(tip_parents)
         .set_tree(old_live_tree.clone())
         .write()
         .await
@@ -426,6 +603,11 @@ async fn extract_async(
         LEDGER_ATTRIBUTE.to_string(),
         serde_json::to_string(&ledger)
             .map_err(|e| format!("could not write the extraction ledger: {e}"))?,
+    );
+    tx.set_attribute(
+        PROGRESS_ATTRIBUTE.to_string(),
+        serde_json::to_string(&progress)
+            .map_err(|e| format!("could not write extraction progress: {e}"))?,
     );
     let operation_description = if extraction.changes.len() == 1 {
         format!("extract session {}", extraction.changes[0].session)
@@ -529,6 +711,10 @@ struct ReplayEdit {
 struct SessionPlan {
     session: String,
     edits: Vec<ReplayEdit>,
+    fallback: Option<Vec<ReplayEdit>>,
+    prior: Option<Commit>,
+    snapshots: Vec<String>,
+    selected: bool,
 }
 
 /// Load history once, before trying alternative placements. Neutral snapshots
@@ -540,34 +726,65 @@ async fn recorded_edits(
     base: &MergedTree,
     session: &str,
     evolog: &[Evolution],
+    consumed: &BTreeSet<String>,
 ) -> Result<Vec<ReplayEdit>, String> {
     let neutral = evolog.first().map(|e| e.user.as_str()).unwrap_or("");
     let mut future_paths = BTreeSet::new();
     let mut edits = Vec::new();
+    if !evolog
+        .iter()
+        .skip(1)
+        .any(|evolution| evolution.user == session && !consumed.contains(&evolution.commit))
+    {
+        return Ok(edits);
+    }
+    // Formatting may predate the last extracted edit on another path. Keep
+    // that optional context available when a later chunk first touches it.
     for index in (1..evolog.len()).rev() {
         let evolution = &evolog[index];
+        if evolution.user == session && consumed.contains(&evolution.commit) {
+            // The parent (or amended prior chunk) already carries this edit's
+            // context. Do not replay older formatting on those paths over it.
+            // Other paths may still need formatting from before this snapshot.
+            let before = load_commit(store, &evolog[index - 1].commit)?;
+            let after = load_commit(store, &evolution.commit)?;
+            let paths = changed_paths(&before.tree(), &after.tree()).await?;
+            let formatting =
+                crate::formatting::equivalent_paths(&before.tree(), &after.tree(), &paths).await?;
+            for path in paths.difference(&formatting) {
+                future_paths.remove(path);
+            }
+            continue;
+        }
         let is_neutral = evolution.user == neutral && evolution.is_snapshot;
-        if evolution.user != session && (!is_neutral || future_paths.is_empty()) {
+        if evolution.user != session && (!evolution.is_snapshot || future_paths.is_empty()) {
             continue;
         }
         let before = load_commit(store, &evolog[index - 1].commit)?;
         let after = load_commit(store, &evolution.commit)?;
         let paths = changed_paths(&before.tree(), &after.tree()).await?;
-        if is_neutral {
-            let overlapping = paths.intersection(&future_paths).cloned().collect();
-            if !BTreeSet::is_empty(&overlapping) {
+        let optional = if is_neutral {
+            paths.clone()
+        } else {
+            crate::formatting::equivalent_paths(&before.tree(), &after.tree(), &paths).await?
+        };
+        if evolution.user == session {
+            let owned: BTreeSet<_> = paths.difference(&optional).cloned().collect();
+            if !owned.is_empty() {
+                future_paths.extend(owned.iter().cloned());
                 edits.push(ReplayEdit {
-                    before: paths_from(base, &before.tree(), &overlapping).await?,
-                    after: paths_from(base, &after.tree(), &overlapping).await?,
-                    neutral: true,
+                    before: paths_from(base, &before.tree(), &owned).await?,
+                    after: paths_from(base, &after.tree(), &owned).await?,
+                    neutral: false,
                 });
             }
-        } else {
-            future_paths.extend(paths);
+        }
+        let overlapping = optional.intersection(&future_paths).cloned().collect();
+        if !BTreeSet::is_empty(&overlapping) {
             edits.push(ReplayEdit {
-                before: before.tree(),
-                after: after.tree(),
-                neutral: false,
+                before: paths_from(base, &before.tree(), &overlapping).await?,
+                after: paths_from(base, &after.tree(), &overlapping).await?,
+                neutral: true,
             });
         }
     }
@@ -576,12 +793,29 @@ async fn recorded_edits(
 }
 
 async fn replay_session(parent: &MergedTree, plan: &SessionPlan) -> Result<MergedTree, String> {
+    let result = replay_edits(parent, &plan.session, &plan.edits).await?;
+    if result.has_conflict() {
+        if let Some(edits) = &plan.fallback {
+            let replayed = replay_edits(parent, &plan.session, edits).await?;
+            if replayed.conflicts().count() < result.conflicts().count() {
+                return Ok(replayed);
+            }
+        }
+    }
+    Ok(result)
+}
+
+async fn replay_edits(
+    parent: &MergedTree,
+    session: &str,
+    edits: &[ReplayEdit],
+) -> Result<MergedTree, String> {
     let mut result = parent.clone();
     let mut carried = Vec::new();
-    for edit in &plan.edits {
+    for edit in edits {
         let merged = apply_delta(&result, &edit.before, &edit.after)
             .await
-            .map_err(|e| format!("could not replay an edit for {}: {e}", plan.session))?;
+            .map_err(|e| format!("could not replay an edit for {session}: {e}"))?;
         let next = if edit.neutral && merged.has_conflict() {
             crate::neutral::keep_clean_hunks(&result, &edit.before, &edit.after, &merged).await?
         } else {
@@ -597,7 +831,7 @@ async fn replay_session(parent: &MergedTree, plan: &SessionPlan) -> Result<Merge
     for (before, after) in carried.iter().rev() {
         let candidate = apply_delta(&result, after, before)
             .await
-            .map_err(|e| format!("could not remove neutral context for {}: {e}", plan.session))?;
+            .map_err(|e| format!("could not remove neutral context for {session}: {e}"))?;
         // Retain only the paths whose inverse conflicts. One adopted rewrite
         // must not drag unrelated neutral edits in another file along with it.
         let mut removable = changed_paths(&result, &candidate).await?;
@@ -611,7 +845,7 @@ async fn replay_session(parent: &MergedTree, plan: &SessionPlan) -> Result<Merge
         // Context is optional. A formatter can depend on an omitted agent even
         // when this session's actual edits commute without the formatting.
         let mut without_context = parent.clone();
-        for edit in plan.edits.iter().filter(|edit| !edit.neutral) {
+        for edit in edits.iter().filter(|edit| !edit.neutral) {
             without_context = apply_delta(&without_context, &edit.before, &edit.after)
                 .await
                 .map_err(|e| format!("could not replay without neutral context: {e}"))?;
@@ -687,7 +921,12 @@ async fn plan_stack(base: &MergedTree, plans: &[SessionPlan]) -> Result<StackPla
         let mut next = Vec::new();
         for prefix in &beam {
             for index in 0..plans.len() {
-                if prefix.order.contains(&index) {
+                if prefix.order.contains(&index)
+                    || (0..index).any(|earlier| {
+                        plans[earlier].session == plans[index].session
+                            && !prefix.order.contains(&earlier)
+                    })
+                {
                     continue;
                 }
                 if replays == MAX_REPLAYS {

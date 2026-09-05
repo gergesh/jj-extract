@@ -64,13 +64,14 @@ run_bash() { # SESSION JSON_COMMAND
   bash_hookev PostToolUse "$1" "$2"
 }
 
-extract_all() { BUILT="$("$BIN" --all 2>&1)"; }
+# The original reconstruction fixtures explicitly exercise opt-in amendment.
+extract_all() { BUILT="$("$BIN" --all --amend 2>&1)"; }
 cid() { echo "$BUILT" | grep "session $1 " | grep -oE 'change [0-9a-z]+' | head -1 | awk '{print $2}'; }
 addedlines() { jj diff -r "$1" --git 2>/dev/null | grep '^+' | grep -v '^+++'; }
 has() { addedlines "$1" | grep -q "$2"; }
 nothas() { ! addedlines "$1" | grep -q "$2"; }
 # One-session extract, echoing just the built change id.
-extract_one() { "$BIN" 2>&1 | grep "session $1 " | grep -oE 'change [0-9a-z]+' | head -1 | awk '{print $2}'; }
+extract_one() { "$BIN" --amend 2>&1 | grep "session $1 " | grep -oE 'change [0-9a-z]+' | head -1 | awk '{print $2}'; }
 # How many extracted changes a session has. Extraction identifies its own
 # changes through the operation-log ledger, not the description, so this counts
 # the default description these fixtures never rewrite.
@@ -189,7 +190,7 @@ ok "special path extracts without conflict" \
 ok "special path leaves no duplicate residual" \
   "! jj diff -r @ --summary | grep -Fq 'picker & time.ts'"
 
-echo "== F: re-running extract updates in place (idempotent), no duplicates =="
+echo "== F: opt-in amendment updates in place without duplicates =="
 new_repo f
 edit a1 f.txt $'l1\nl2\nl3\nONE\n'
 ID1="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
@@ -304,7 +305,7 @@ LEGACY_BASE="$(jj log -r '@---' --no-graph -T 'change_id.short()')"
 jj rebase -r "$LEGACY_A2" -d "$LEGACY_BASE" >/dev/null 2>&1
 jj rebase -r @ -d "$LEGACY_BASE" >/dev/null 2>&1
 ok "legacy fixture has one live and two sibling heads" "[ \"$(n_heads)\" = 3 ]"
-JJ_EXTRACT_AGENT=a1 "$BIN" >/dev/null 2>&1
+JJ_EXTRACT_AGENT=a1 "$BIN" --amend >/dev/null 2>&1
 CURRENT_A1_ID="$(jj log -r 'description(substring:"jj-extract: a1")' --no-graph -T 'change_id.short()')"
 CURRENT_A2_ID="$(jj log -r 'description(substring:"jj-extract: a2")' --no-graph -T 'change_id.short()')"
 ok "next extraction collapses legacy siblings to one head" \
@@ -463,7 +464,7 @@ ok "a dry run leaves the live working-copy change untouched" \
 DRY_ID="$(JJ_EXTRACT_AGENT=a1 extract_one a1)"
 ok "the extraction that follows contains what the preview named" \
   "has '$DRY_ID' DRY-ONE && has '$DRY_ID' DRY-TWO"
-UPDATE_PREVIEW="$(JJ_EXTRACT_AGENT=a1 "$BIN" --dry-run 2>&1)"
+UPDATE_PREVIEW="$(JJ_EXTRACT_AGENT=a1 "$BIN" --amend --dry-run 2>&1)"
 ok "a dry run over an extracted session previews an update to its change" \
   "echo \"\$UPDATE_PREVIEW\" | grep -q 'would update' && echo \"\$UPDATE_PREVIEW\" | grep -q 'change $DRY_ID'"
 ok "a dry run after extraction still leaves one change and one head" \
@@ -650,14 +651,14 @@ jj edit "$LIVE_ID" >/dev/null 2>&1
 edit a1 f.txt $'A1-LATER\nl2\nl3\n'
 LIVE_BEFORE="$(jj log -r @ --no-graph -T commit_id)"
 OP_BEFORE="$(op_id)"
-PREVIEW="$(JJ_EXTRACT_AGENT=a1 "$BIN" --dry-run 2>&1)"
+PREVIEW="$(JJ_EXTRACT_AGENT=a1 "$BIN" --amend --dry-run 2>&1)"
 ok "dry run detects descendant conflicts without publishing" \
   "echo \"\$PREVIEW\" | grep -q 'descendant change $SIDE_ID' && [ \"$(op_id)\" = '$OP_BEFORE' ]"
-REFUSED="$(JJ_EXTRACT_AGENT=a1 "$BIN" 2>&1)"
+REFUSED="$(JJ_EXTRACT_AGENT=a1 "$BIN" --amend 2>&1)"
 REFUSED_STATUS=$?
 ok "new descendant conflicts require opt-in before publication" \
   "[ '$REFUSED_STATUS' -ne 0 ] && echo \"\$REFUSED\" | grep -q descendant && [ \"$(op_id)\" = '$OP_BEFORE' ] && ! is_conflict '$SIDE_ID'"
-ALLOWED="$(JJ_EXTRACT_AGENT=a1 "$BIN" --allow-conflicts 2>&1)"
+ALLOWED="$(JJ_EXTRACT_AGENT=a1 "$BIN" --amend --allow-conflicts 2>&1)"
 ALLOWED_STATUS=$?
 ok "explicit opt-in permits and reports the descendant conflict" \
   "[ '$ALLOWED_STATUS' -eq 0 ] && is_conflict '$SIDE_ID' && echo \"\$ALLOWED\" | grep -q 'descendant change $SIDE_ID' && same_tree '$LIVE_BEFORE'"
@@ -701,6 +702,94 @@ REFUSED="$(JJ_EXTRACT_AGENT=a1 "$BIN" --allow-conflicts 2>&1)"
 REFUSED_STATUS=$?
 ok "tree verification fails before publishing or checking out a stale workspace" \
   "[ '$REFUSED_STATUS' -ne 0 ] && echo \"\$REFUSED\" | grep -q 'live tree verification failed' && [ \"$(op_id)\" = '$OP_BEFORE' ] && cmp -s f.txt '$WORK/stale-before.txt'"
+
+
+echo "== AE: repeated extraction appends only pending edits =="
+new_repo ae
+edit a1 f.txt $'l1\nl2\nl3\nFIRST\n'
+BUILT="$("$BIN" --agent a1 2>&1)"
+FIRST="$(cid a1)"
+jj describe -r "$FIRST" -m first-chunk >/dev/null 2>&1
+FIRST_HASH="$(jj log -r "$FIRST" --no-graph -T commit_id)"
+edit a1 f.txt $'l1\nl2\nl3\nFIRST\nSECOND\n'
+BEFORE="$(jj log -r @ --no-graph -T commit_id)"
+OP_BEFORE="$(op_id)"
+PREVIEW="$("$BIN" --agent a1 --dry-run 2>&1)"
+ok "incremental preview proposes a new change without consuming edits" \
+  "echo \"\$PREVIEW\" | grep -q 'a new change' && [ \"$(op_id)\" = '$OP_BEFORE' ]"
+BUILT="$("$BIN" --agent a1 2>&1)"
+SECOND="$(cid a1)"
+ok "default creates a separate second chunk with only new edits" \
+  "[ -n '$SECOND' ] && [ '$FIRST' != '$SECOND' ] && has '$SECOND' SECOND && nothas '$SECOND' FIRST && same_tree '$BEFORE'"
+ok "default leaves the earlier commit and description untouched" \
+  "[ \"$(jj log -r "$FIRST" --no-graph -T commit_id)\" = '$FIRST_HASH' ] && [ \"$(desc "$FIRST")\" = first-chunk ]"
+OP_BEFORE="$(op_id)"
+EMPTY="$("$BIN" --agent a1 2>&1)"
+ok "no pending edits creates neither a commit nor an operation" \
+  "echo \"\$EMPTY\" | grep -q 'Nothing new' && [ \"$(op_id)\" = '$OP_BEFORE' ]"
+edit a1 f.txt $'l1\nl2\nl3\nFIRST\nSECOND\nTHIRD\n'
+BUILT="$("$BIN" --agent a1 --amend 2>&1)"
+ok "amend updates only the latest chunk" \
+  "has '$SECOND' SECOND && has '$SECOND' THIRD && nothas '$SECOND' FIRST && [ \"$(jj log -r "$FIRST" --no-graph -T commit_id)\" = '$FIRST_HASH' ]"
+SECOND_HASH="$(jj log -r "$SECOND" --no-graph -T commit_id)"
+edit a1 f.txt $'l1\nl2\nl3\nFIRST\nSECOND\nTHIRD\nFOURTH\n'
+BUILT="$("$BIN" --agent a1 2>&1)"
+FOURTH="$(cid a1)"
+ok "default after amend begins another independent chunk" \
+  "[ -n '$FOURTH' ] && [ '$FOURTH' != '$SECOND' ] && has '$FOURTH' FOURTH && nothas '$FOURTH' THIRD && [ \"$(jj log -r "$SECOND" --no-graph -T commit_id)\" = '$SECOND_HASH' ]"
+jj undo >/dev/null 2>&1
+BUILT="$("$BIN" --agent a1 2>&1)"
+ok "undo restores pending edits as well as the graph" \
+  "has '$(cid a1)' FOURTH && nothas '$(cid a1)' THIRD"
+# Squashing chunks is a normal user action; the operation checkpoint must still
+# remember their edits even when an extraction change disappears.
+jj squash --from "$(cid a1)" --into "$SECOND" -m combined >/dev/null 2>&1
+SQUASH_STATUS=$?
+OP_BEFORE="$(op_id)"
+EMPTY="$("$BIN" --agent a1 2>&1)"
+ok "manual squash does not cause historical edits to be extracted again" \
+  "[ '$SQUASH_STATUS' -eq 0 ] && echo \"\$EMPTY\" | grep -q 'Nothing new' && [ \"$(op_id)\" = '$OP_BEFORE' ]"
+
+echo "== AF: independent session checkpoints and interleaved dependencies =="
+new_repo af
+edit a1 f.txt $'X\nl2\nl3\n'
+BUILT="$("$BIN" --agent a1 2>&1)"
+X1="$(cid a1)"
+X1_HASH="$(jj log -r "$X1" --no-graph -T commit_id)"
+edit a2 f.txt $'Y\nl2\nl3\n'
+BUILT="$("$BIN" --all 2>&1)"
+Y1="$(cid a2)"
+ok "all extracts only sessions with pending edits" \
+  "[ -z '$(cid a1)' ] && [ -n '$Y1' ] && has '$Y1' Y"
+edit a1 f.txt $'X2\nl2\nl3\n'
+BEFORE="$(jj log -r @ --no-graph -T commit_id)"
+BUILT="$("$BIN" --agent a1 2>&1)"
+X2="$(cid a1)"
+ok "X then Y then X appends cleanly instead of creating an amend cycle" \
+  "[ -n '$X2' ] && ! is_conflict '$X2' && [ \"$(jj log -r "$X2-" --no-graph -T 'change_id.short()')\" = '$Y1' ] && same_tree '$BEFORE' && [ \"$(jj log -r "$X1" --no-graph -T commit_id)\" = '$X1_HASH' ]"
+
+
+echo "== AG: amendment retains manual content and descriptions =="
+new_repo ag
+edit a1 f.txt $'l1\nl2\nl3\nFIRST\n'
+BUILT="$("$BIN" --agent a1 2>&1)"
+FIRST="$(cid a1)"
+jj describe -m shared-live >/dev/null 2>&1
+LIVE_ID="$(jj log -r @ --no-graph -T 'change_id.short()')"
+jj edit "$FIRST" >/dev/null 2>&1
+printf 'MANUAL\n' >>f.txt
+jj describe -m reviewed-content >/dev/null 2>&1
+jj edit "$LIVE_ID" >/dev/null 2>&1
+edit a1 f.txt $'l1\nl2\nl3\nFIRST\nMANUAL\nNEXT\n'
+BEFORE="$(jj log -r @ --no-graph -T commit_id)"
+BUILT="$("$BIN" --agent a1 --amend 2>&1)"
+ok "amend preserves manual edits instead of reconstructing over them" \
+  "has '$FIRST' FIRST && has '$FIRST' MANUAL && has '$FIRST' NEXT && [ \"$(desc "$FIRST")\" = reviewed-content ] && same_tree '$BEFORE'"
+for mode in --install --uninstall --hook; do
+  "$BIN" "$mode" --amend >/dev/null 2>&1
+  STATUS=$?
+  ok "$mode rejects an irrelevant --amend" "[ '$STATUS' -ne 0 ]"
+done
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

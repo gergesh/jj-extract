@@ -26,9 +26,10 @@ jj describe -r <change-id> -m "<what changed and why>"
 ```
 
 Use the printed change id for review or handoff. Extracted session changes form
-a linear stack below the live working copy. The tool can reorder them to avoid
-conflicts, including moving an existing change while preserving its ID. Read the
-printed placement; do not assume first-edit order or create a separate branch.
+a linear stack below the live working copy. Each extraction creates a new change
+with only edits since this session’s previous extraction; no pending edits means
+no change. New changes can be reordered to avoid conflicts. Read the printed
+placement; do not assume first-edit order or create a separate branch.
 
 ## Rules
 
@@ -36,6 +37,10 @@ printed placement; do not assume first-edit order or create a separate branch.
   Claude Code file tools, and for a Claude Code Bash call whose only effect is
   writing files.
 - Run `jj extract` after a coherent chunk of work, before handing it off.
+- Use `--amend` only when intentionally adding pending edits to the session’s
+  latest extracted change. It may move or rebase earlier extracted changes to
+  avoid conflicts. Default extraction preserves them exactly; chunks can be
+  combined later with `jj squash`.
 - Describe the extracted change with `jj describe`. `jj extract` takes no `-m`
   and writes no description of its own; it never overwrites one already there.
 - Use `jj extract --all` only when intentionally collecting every recorded
@@ -51,7 +56,8 @@ printed placement; do not assume first-edit order or create a separate branch.
 - The tool verifies that the live tree is unchanged. A verification failure must
   be investigated; `--allow-conflicts` does not bypass this check.
 - Formatting can be dropped or adopted to avoid conflicts. The tool uses
-  word-level merging and optional neutral context, but preserves real conflicts
-  between attributed edits. Cyclic dependencies may still require resolution.
+  word-level merging and optional neutral context. With rustfmt installed,
+  Rust formatter-only edits are optional even when made by an agent. Real
+  conflicts between substantive edits are preserved. Cyclic dependencies may still require resolution.
 - If the command is unavailable, continue working normally and mention that the
   integration is not installed.

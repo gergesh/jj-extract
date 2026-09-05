@@ -4,7 +4,8 @@
 Run directly to reproduce a seed, or through scripts/check.sh. Formatters run
 between batches of file tools, while all five agent sessions are mid-task. File
 tools within each batch contend on the actual jj-extract edit lock; the test
-does not supply a replacement lock. No extraction uses --allow-conflicts.
+does not supply a replacement lock. Formatter sweeps alternate between neutral
+and agent-attributed edits. No extraction uses --allow-conflicts.
 """
 
 import argparse
@@ -26,7 +27,7 @@ ROUNDS = 4
 
 
 class Scenario:
-    def __init__(self, directory, binary, seed):
+    def __init__(self, directory, binary, seed, amend):
         self.root = Path(directory)
         self.binary = binary
         self.seed = seed
@@ -35,7 +36,10 @@ class Scenario:
                         JJ_EXTRACT_HOME=str(self.root / ".hook-state"))
         for name in ("JJ_EXTRACT_AGENT", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
             self.env.pop(name, None)
+        self.amend = amend
         self.ids = {}
+        self.versions = {}
+        self.pending = set()
         self.expected = [0] * AGENTS
         self.formats = 0
         self.handoffs = False
@@ -81,6 +85,7 @@ class Scenario:
 
     def edit(self, agent, value):
         # Read only after PreToolUse has acquired the real cross-process lock.
+        self.pending.add(agent)
         self.hook("PreToolUse", agent)
         try:
             self.history.append(f"agent {agent}: {value}")
@@ -98,8 +103,15 @@ class Scenario:
 
     def format(self):
         width = self.random.choice((40, 80, 120))
-        self.history.append(f"rustfmt: max_width={width}")
-        self.run("rustfmt", "--edition", "2021", "--config", f"max_width={width}", *FORMATTED)
+        agent = self.formats % AGENTS if self.formats % 2 else None
+        self.history.append(f"rustfmt: max_width={width}, agent={agent}")
+        if agent is not None:
+            self.hook("PreToolUse", agent, FORMATTED)
+        try:
+            self.run("rustfmt", "--edition", "2021", "--config", f"max_width={width}", *FORMATTED)
+        finally:
+            if agent is not None:
+                self.hook("PostToolUse", agent, FORMATTED)
         self.formats += 1
 
     def values(self, revision):
@@ -118,6 +130,8 @@ class Scenario:
                              "-T", "self.id()")
         disk = {path: (self.root / path).read_bytes() for path in (*FORMATTED, "neutral.txt")}
         args = [self.binary, "--all"] if agent is None else [self.binary, "--agent", self.session(agent)]
+        if self.amend:
+            args.append("--amend")
         if preview:
             args.append("--dry-run")
         output = self.run(*args)
@@ -130,13 +144,30 @@ class Scenario:
             assert self.run("jj", "--ignore-working-copy", "op", "log", "--no-graph", "-n", "1",
                             "-T", "self.id()") == operation
             return
-        assert self.run("jj", "--ignore-working-copy", "op", "log", "--no-graph", "-n", "1",
-                        "-T", 'self.parents().map(|p| p.id()).join("\\n")') == operation
+        selected = self.pending.copy() if agent is None else self.pending.intersection({agent})
+        if self.amend or selected:
+            assert self.run("jj", "--ignore-working-copy", "op", "log", "--no-graph", "-n", "1",
+                            "-T", 'self.parents().map(|p| p.id()).join("\\n")') == operation
+        else:
+            assert self.run("jj", "--ignore-working-copy", "op", "log", "--no-graph", "-n", "1",
+                            "-T", "self.id()") == operation
+        if not self.amend:
+            for change, version in self.versions.items():
+                assert self.run("jj", "log", "-r", change, "--no-graph", "-T", "commit_id") == version
+        extracted = {}
         for index, change in re.findall(rf"session parallel-{self.seed}-(\d+) → change (\w+)", output):
             index = int(index)
-            assert self.ids.get(index, change) == change, "re-extraction changed an ID"
+            if self.amend:
+                assert self.ids.get(index, change) == change, "amend changed an ID"
+            else:
+                assert change not in self.versions, "default reused an existing change"
+            extracted[index] = change
             self.ids[index] = change
-        for index, change in self.ids.items():
+            self.versions[change] = self.run("jj", "log", "-r", change, "--no-graph", "-T", "commit_id")
+        if not self.amend:
+            assert set(extracted) == selected, (extracted, selected)
+        self.pending.difference_update(selected)
+        for index, change in extracted.items():
             before_values = self.values(change + "-")
             after_values = self.values(change)
             for before_file, after_file in zip(before_values, after_values):
@@ -178,7 +209,7 @@ class Scenario:
                     self.format()
                 (self.root / "neutral.txt").write_text(f"base\nHUMAN-{self.seed}\n")
                 # Continue editing after formatting, then extract mid-task so
-                # later edits also exercise updating previously extracted IDs.
+                # later edits exercise both incremental and amended extraction.
                 if (sum(counts) >= 10 and not mid_extracted) or sum(counts) == AGENTS * ROUNDS:
                     self.extract(preview=True)
                     self.extract()
@@ -186,6 +217,7 @@ class Scenario:
         # A reverse handoff makes all five existing changes depend on a new
         # placement, while unrelated original contributions stay with their owner.
         for agent in reversed(range(AGENTS)):
+            self.pending.add(agent)
             self.hook("PreToolUse", agent, ("handoff.rs",))
             self.history.append(f"handoff: agent {agent}")
             (self.root / "handoff.rs").write_text(
@@ -204,7 +236,8 @@ class Scenario:
         assert len(self.ids) == AGENTS
         assert self.values("@")[0] == dict(enumerate(self.expected))
         assert "neutral.txt" in self.run("jj", "diff", "-r", "@", "--summary")
-        print(f"PASS: seed {self.seed}, five concurrent agents, {AGENTS * (ROUNDS + 1)} edits, "
+        mode = "amend" if self.amend else "incremental"
+        print(f"PASS: {mode}, seed {self.seed}, five concurrent agents, {AGENTS * (ROUNDS + 1)} code edits, "
               f"{self.formats} rustfmt sweeps; clean attribution, IDs and live tree", flush=True)
 
 
@@ -213,14 +246,17 @@ def main():
     parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/jj-extract")
     parser.add_argument("--seed", type=int, action="append", help="reproduce a specific schedule")
     args = parser.parse_args()
-    for seed in args.seed or (7, 42, 99):
-        with tempfile.TemporaryDirectory(prefix=f"jj-extract-five-{seed}-") as directory:
-            scenario = Scenario(directory, str(args.binary.resolve()), seed)
-            try:
-                scenario.exercise()
-            except Exception:
-                print(f"Failed seed {seed}; actual edit/format order:\n" + "\n".join(scenario.history), flush=True)
-                raise
+    for amend in (False, True):
+        for seed in args.seed or (7, 42, 99):
+            with tempfile.TemporaryDirectory(prefix=f"jj-extract-five-{seed}-") as directory:
+                scenario = Scenario(directory, str(args.binary.resolve()), seed, amend)
+                try:
+                    scenario.exercise()
+                except Exception:
+                    print(f"Failed seed {seed}, amend={amend}; actual edit/format order:\n"
+                          + "\n".join(scenario.history), flush=True)
+                    raise
+
 
 
 if __name__ == "__main__":
